@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# devstack — генератор .env и обёртка над docker compose.
+# Зависимостей нет (bash + docker). Работает в WSL/Linux/macOS.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+COMPOSE_FILE="$SCRIPT_DIR/compose.yaml"
+ISOLATE_FILE="$SCRIPT_DIR/compose.isolate.yaml"
+PODMAN_FILE="$SCRIPT_DIR/compose.podman.yaml"
+
+# Сборка оверлеев:
+#   read-only root — ВЫКЛ по умолчанию (внутри агент свободен), вкл DEVSTACK_READONLY_ROOT=1
+compose() {
+  resolve_engine
+  local files=(-f "$COMPOSE_FILE")
+  # keep-id подключаем ТОЛЬКО при rootless podman: под root-podman (и docker)
+  # маппинг uid не нужен — там работает старая схема с HOST_UID в образе,
+  # а --userns=keep-id под root вообще не поддерживается.
+  if [ "$ENGINE" = "podman" ] && is_rootless_podman; then
+    files+=(-f "$PODMAN_FILE")
+  fi
+  if [ -f "$ENV_FILE" ]; then
+    if grep -q '^DEVSTACK_READONLY_ROOT=1' "$ENV_FILE" 2>/dev/null; then
+      files+=(-f "$ISOLATE_FILE")
+    fi
+  fi
+  if [ "$ENGINE" = "podman" ]; then
+    command -v podman-compose >/dev/null 2>&1 || {
+      echo "CONTAINER_ENGINE=podman, но podman-compose не найден." >&2
+      echo "Поставь: sudo apt install podman-compose   (или: pipx install podman-compose)" >&2
+      exit 1
+    }
+    # --in-pod false: у нас один контейнер, pod не нужен, а keep-id внутри
+    # pod'а не работает (userns задаётся на уровне pod'а, не контейнера).
+    podman-compose --in-pod false --env-file "$ENV_FILE" "${files[@]}" "$@"
+  else
+    docker compose --env-file "$ENV_FILE" "${files[@]}" "$@"
+  fi
+}
+
+# Значение ключа из .env. НЕ сорсим .env целиком: в DEVSTACK_POSTCREATE лежат
+# команды с && — при source они бы выполнились прямо на хосте.
+env_get() {
+  [ -f "$ENV_FILE" ] || return 0
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -1
+}
+
+ENGINE=""
+resolve_engine() {
+  [ -n "$ENGINE" ] && return 0
+  local want; want="$(env_get CONTAINER_ENGINE)"; want="${want:-auto}"
+  case "$want" in
+    docker|podman) ENGINE="$want";;
+    auto)
+      # Предсказуемо: docker, если он есть; иначе podman. Осознанная миграция —
+      # это CONTAINER_ENGINE=podman в .env, а не гадание в auto.
+      if command -v docker >/dev/null 2>&1; then ENGINE=docker
+      elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+      else echo "Не найден ни docker, ни podman." >&2; exit 1
+      fi;;
+    *) echo "CONTAINER_ENGINE=$want в .env — ожидаю auto|docker|podman" >&2; exit 1;;
+  esac
+}
+
+is_rootless_podman() {
+  [ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" = "true" ]
+}
+
+sanitize() { # -> нижний регистр, только [a-z0-9_.-]
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g'
+}
+
+usage() {
+  cat <<'EOF'
+devstack v5 — универсальное dev-окружение в контейнере (docker или podman)
+
+Команды:
+  init      Сгенерировать .env под проект (интерактивно или через флаги)
+  up        Поднять контейнер (build при необходимости)
+  rebuild   Пересобрать образ с нуля и поднять
+  shell     Зайти в bash внутрь контейнера (пользователь dev; sudo без пароля)
+  root      Зайти под root в живой контейнер (то же даёт `sudo -i` внутри).
+            ./devstack root apt-get update && ./devstack root apt-get install -y htop
+  down      Остановить и удалить контейнер
+  logs      Показать логи
+  config    Показать итоговый compose (полезно для проверки .env)
+  provision Перезапустить DEVSTACK_POSTCREATE (сброс «один раз»-сентинела)
+  check     Проверить периметр: единственный host-маунт = проект, нет socket и т.п.
+
+Модель (free-agent): ВНУТРИ контейнера агент свободен — пользователь dev с
+беспарольным sudo, пишет/ставит что угодно в рантайме. СНАРУЖИ хост запечатан:
+  - единственный мостик к хосту — папка проекта (/workspace). home — docker-том,
+    не папка хоста; других host-маунтов нет.
+  - не монтируется docker.sock/podman.sock, нет --privileged, нет host-namespaces.
+  - read-only корневая ФС по умолчанию ВЫКЛ (внутри свобода). Вкл при желании:
+    DEVSTACK_READONLY_ROOT=1.
+
+Провижининг проекта (в .env, проект НЕ модифицируется):
+  DEVSTACK_POSTCREATE   список команд установки, ОДИН РАЗ на жизнь тома
+                        (напр. "npm ci && npx playwright install chromium")
+  DEVSTACK_POSTSTART    идемпотентные шаги на КАЖДЫЙ старт
+
+Движок: CONTAINER_ENGINE в .env (auto|docker|podman, дефолт auto = docker,
+если он есть, иначе podman). Podman-путь требует podman-compose; в rootless
+автоматически включается keep-id (см. compose.podman.yaml) — файлы в /workspace
+остаются твоими. Rootless-лимиты требуют cgroups v2 (проверка: ./devstack check).
+
+Флаги init (всё опционально, иначе спросит/возьмёт дефолт):
+  --project PATH     путь к проекту на хосте      (дефолт: текущая папка)
+  --engine ENGINE    auto | docker | podman        (дефолт: auto)
+  --name NAME        имя стека                      (дефолт: имя папки проекта)
+  --base IMAGE       базовый образ; без флага init предложит меню
+                     (node:22/24-slim, python, temurin-jdk, golang, ubuntu, свой)
+  --node MAJOR       версия Node, 0 = не ставить (для node:* авто-дефолт 0)
+  --codex            установить OpenAI Codex CLI      (бинарь: codex)
+  --claude-code      установить Claude Code CLI       (бинарь: claude)
+  --no-codex / --no-claude-code   явно НЕ ставить (пропустить вопрос)
+  --ai PKG           доп. npm-пакеты AI-CLI сверх двух выше (дефолт: пусто)
+  --playwright       поставить apt-зависимости Playwright + дефолтный postcreate
+  --postcreate "..." команды инициализации (DEVSTACK_POSTCREATE)
+  --extra-apt "..."  доп. apt-пакеты через пробел
+  --yes              без вопросов, брать дефолты
+  --force            перезаписать существующий .env
+
+Примеры:
+  ./devstack init --project ~/code/myapp --base node:22-bookworm-slim \
+      --codex --claude-code --yes
+  ./devstack init --project ~/code/myapp --claude-code \
+      --extra-apt "postgresql-client" --playwright --yes
+  ./devstack up && ./devstack shell
+EOF
+}
+
+cmd_init() {
+  local project="" name="" base="" node="" ai="" playwright="0" extra_apt="" postcreate="" yes="0" force="0" engine="auto"
+  local codex="" claude_code=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project) project="$2"; shift 2;;
+      --engine) engine="$2"; shift 2;;
+      --name) name="$2"; shift 2;;
+      --base) base="$2"; shift 2;;
+      --node) node="$2"; shift 2;;
+      --codex) codex="1"; shift;;
+      --no-codex) codex="0"; shift;;
+      --claude-code) claude_code="1"; shift;;
+      --no-claude-code) claude_code="0"; shift;;
+      --ai) ai="$2"; shift 2;;
+      --playwright) playwright="1"; shift;;
+      --extra-apt) extra_apt="$2"; shift 2;;
+      --postcreate) postcreate="$2"; shift 2;;
+      --yes|-y) yes="1"; shift;;
+      --force|-f) force="1"; shift;;
+      *) echo "Неизвестный флаг: $1" >&2; exit 2;;
+    esac
+  done
+
+  if [ -f "$ENV_FILE" ] && [ "$force" != "1" ]; then
+    echo ".env уже существует. Перезаписать — добавь --force." >&2
+    exit 1
+  fi
+
+  ask() { # ask VAR "prompt" "default"
+    local __var="$1" __prompt="$2" __def="$3" __in=""
+    if [ "$yes" = "1" ] || [ ! -t 0 ]; then
+      printf -v "$__var" '%s' "$__def"; return
+    fi
+    read -r -p "$__prompt [$__def]: " __in || true
+    printf -v "$__var" '%s' "${__in:-$__def}"
+  }
+
+  # ask_choice VAR "prompt" default_value opt1 opt2 ... — меню с номерами + свой вариант.
+  ask_choice() {
+    local __var="$1" __prompt="$2" __def="$3"; shift 3
+    local __opts=("$@") __n=$# __i __in="" o
+    if [ "$yes" = "1" ] || [ ! -t 0 ]; then
+      printf -v "$__var" '%s' "$__def"; return
+    fi
+    printf '%s:\n' "$__prompt" >&2
+    __i=1
+    for o in "${__opts[@]}"; do
+      if [ "$o" = "$__def" ]; then printf '  %d) %s  (по умолчанию)\n' "$__i" "$o" >&2
+      else printf '  %d) %s\n' "$__i" "$o" >&2; fi
+      __i=$((__i+1))
+    done
+    printf '  %d) свой вариант\n' "$__i" >&2
+    read -r -p "Выбор [номер, Enter = по умолчанию]: " __in || true
+    if [ -z "$__in" ]; then printf -v "$__var" '%s' "$__def"; return; fi
+    if [ "$__in" = "$__i" ]; then
+      read -r -p "Введи образ (напр. node:22-bookworm-slim): " __in || true
+      printf -v "$__var" '%s' "$__in"; return
+    fi
+    if printf '%s' "$__in" | grep -Eq '^[0-9]+$' && [ "$__in" -ge 1 ] && [ "$__in" -le "$__n" ]; then
+      printf -v "$__var" '%s' "${__opts[$((__in-1))]}"
+    else
+      printf -v "$__var" '%s' "$__in"   # ввели строку образа напрямую
+    fi
+  }
+
+  [ -n "$project" ] || ask project "Путь к проекту" "$(pwd)"
+  # Введённый в промпте `~/code/app` шеллом НЕ раскрывается (в отличие от флага
+  # --project) — раскрываем сами, иначе получим папку с именем "~".
+  case "$project" in
+    "~")   project="$HOME";;
+    "~/"*) project="$HOME/${project#\~/}";;
+  esac
+  project="$(cd "$project" 2>/dev/null && pwd || echo "$project")"
+  # Без этой проверки опечатка в пути молча превращается в пустую папку: bind
+  # с create_host_path создаст её при первом `up`, и /workspace будет пустым.
+  if [ ! -d "$project" ]; then
+    echo "Папки проекта нет: $project" >&2
+    echo "Создай её или укажи существующий путь: ./devstack init --project PATH" >&2
+    exit 1
+  fi
+  local def_name; def_name="$(sanitize "$(basename "$project")")"
+  [ -n "$name" ] || ask name "Имя стека" "$def_name"
+  name="$(sanitize "$name")"
+  # Базовый образ: выбор из списка (или свой вариант). Флаг --base пропускает меню.
+  [ -n "$base" ] || ask_choice base "Базовый образ" "node:22-bookworm-slim" \
+    "node:22-bookworm-slim" \
+    "node:24-bookworm-slim" \
+    "python:3.12-bookworm" \
+    "eclipse-temurin:25-jdk-noble" \
+    "golang:1.22-bookworm" \
+    "ubuntu:24.04"
+  # В node:* образах Node уже есть — по умолчанию не доустанавливаем (NODE_MAJOR=0).
+  local node_def="22"; case "$base" in node:*) node_def="0";; esac
+  [ -n "$node" ] || ask node "Версия Node (0 = нет; в node:* уже есть)" "$node_def"
+
+  # ask_yn VAR "prompt" default(0|1)
+  ask_yn() {
+    local __var="$1" __prompt="$2" __def="$3" __in="" __hint="[y/N]"
+    [ "$__def" = "1" ] && __hint="[Y/n]"
+    if [ "$yes" = "1" ] || [ ! -t 0 ]; then
+      printf -v "$__var" '%s' "$__def"; return
+    fi
+    read -r -p "$__prompt $__hint: " __in || true
+    case "${__in:-}" in
+      y|Y|yes|Yes|YES) printf -v "$__var" '%s' "1";;
+      n|N|no|No|NO)    printf -v "$__var" '%s' "0";;
+      "")              printf -v "$__var" '%s' "$__def";;
+      *)               printf -v "$__var" '%s' "$__def";;
+    esac
+  }
+
+  # v5: отдельные чекбоксы под каждый AI-CLI.
+  [ -n "$codex" ]       || ask_yn codex       "Установить OpenAI Codex CLI (@openai/codex)?" "0"
+  [ -n "$claude_code" ] || ask_yn claude_code "Установить Claude Code CLI (@anthropic-ai/claude-code)?" "0"
+  [ -n "$ai" ]  || ask ai  "Доп. AI-CLI (npm-пакеты, пусто = нет)" ""
+  if [ "$playwright" = "0" ]; then
+    ask_yn playwright "Поставить системные зависимости Playwright?" "0"
+  fi
+
+  # Оба CLI ставятся через npm и требуют Node 22+. Без npm сборка упадёт — ловим заранее.
+  if [ "$codex" = "1" ] || [ "$claude_code" = "1" ] || [ -n "$ai" ]; then
+    case "$base" in
+      node:*) : ;;  # Node уже в образе
+      *) if [ "$node" = "0" ]; then
+           echo "ВНИМАНИЕ: выбран AI-CLI, но NODE_MAJOR=0 и база не node:* — npm не будет." >&2
+           echo "          Ставлю NODE_MAJOR=22 (npm-путь codex/claude-code требует Node 22+)." >&2
+           node="22"
+         elif [ "$node" -lt 22 ] 2>/dev/null; then
+           echo "ВНИМАНИЕ: codex/claude-code официально требуют Node 22+, а выбран Node $node." >&2
+         fi;;
+    esac
+  fi
+
+  # Удобный дефолт: для Playwright-проекта сразу прописать установку браузеров.
+  if [ -z "$postcreate" ] && [ "$playwright" = "1" ]; then
+    postcreate="npm ci && npx playwright install chromium"
+  fi
+
+  case "$engine" in auto|docker|podman) :;; *) echo "--engine $engine — ожидаю auto|docker|podman" >&2; exit 2;; esac
+
+  local uid gid; uid="$(id -u)"; gid="$(id -g)"
+
+  cat > "$ENV_FILE" <<EOF
+STACK_NAME=$name
+PROJECT_DIR=$project
+# Движок: auto (docker, если он есть, иначе podman) | docker | podman.
+# Миграция на podman = поменять это значение (том home и образ пересоздадутся).
+CONTAINER_ENGINE=$engine
+HOST_UID=$uid
+HOST_GID=$gid
+BASE_IMAGE=$base
+NODE_MAJOR=$node
+EXTRA_APT=$extra_apt
+# AI-CLI: отдельные переключатели (1/0). Меняешь тут -> ./devstack rebuild.
+#   codex -> бинарь \`codex\`;  claude-code -> бинарь \`claude\`
+INSTALL_CODEX=$codex
+INSTALL_CLAUDE_CODE=$claude_code
+# Доп. npm-пакеты сверх двух выше (напр. @google/gemini-cli), через пробел.
+AI_CLI_NPM=$ai
+INSTALL_PLAYWRIGHT=$playwright
+# Провижининг: команды подготовки окружения (см. .env.example / README).
+# ОДИН РАЗ на жизнь тома home (повтор: ./devstack provision):
+DEVSTACK_POSTCREATE=$postcreate
+# На каждый старт:
+DEVSTACK_POSTSTART=
+# Изоляция корневой ФС: 0 = ВЫКЛ (по умолчанию — внутри агент свободен, пишет
+# куда угодно), 1 = read-only root (необязательно для free-agent модели).
+DEVSTACK_READONLY_ROOT=0
+MEM_LIMIT=4g
+CPUS=2
+SHM_SIZE=1g
+EOF
+
+  # Папка hooks для многошагового провижининга (монтируется в /opt/devstack/hooks).
+  mkdir -p "$SCRIPT_DIR/hooks"
+  if [ ! -f "$SCRIPT_DIR/hooks/postcreate.sh.example" ]; then
+    cat > "$SCRIPT_DIR/hooks/postcreate.sh.example" <<'HOOK'
+#!/usr/bin/env bash
+# Пример многошагового postcreate. Скопируй в postcreate.sh, сделай chmod +x и
+# пропиши в .env:  DEVSTACK_POSTCREATE=bash /opt/devstack/hooks/postcreate.sh
+set -euo pipefail
+cd /workspace
+
+npm ci
+npx playwright install chromium
+# npm run build
+# ./scripts/seed-db.sh
+HOOK
+  fi
+
+  local cli_list=""
+  if [ "$codex" = "1" ]; then cli_list="codex"; fi
+  if [ "$claude_code" = "1" ]; then cli_list="${cli_list:+$cli_list, }claude-code"; fi
+  if [ -n "$ai" ]; then cli_list="${cli_list:+$cli_list, }$ai"; fi
+
+  echo "Готово: $ENV_FILE"
+  echo "  стек:    $name  (image/container: $name-dev, том home: $name-home)"
+  echo "  проект:  $project -> /workspace   (единственный мостик к хосту)"
+  echo "  база:    $base   node:$node   playwright:$playwright"
+  echo "  AI-CLI:  ${cli_list:-—}"
+  echo "  движок:  $engine$([ "$engine" = "auto" ] && { resolve_engine; printf ' -> %s' "$ENGINE"; } || true)"
+  echo "  модель:  внутри свобода (dev + sudo), снаружи хост запечатан"
+  echo "Дальше:  ./devstack up && ./devstack shell    (периметр: ./devstack check)"
+}
+
+require_env() {
+  [ -f "$ENV_FILE" ] || { echo "Нет .env — сначала ./devstack init" >&2; exit 1; }
+}
+
+cmd_check() {
+  require_env
+  local cfg ok=0
+  cfg="$(compose config 2>/dev/null)" || { echo "compose config упал — проверь .env/docker" >&2; exit 1; }
+
+  echo "Периметр (free-agent: внутри свобода, снаружи хост запечатан):"
+
+  # движок
+  resolve_engine
+  if [ "$ENGINE" = "podman" ]; then
+    if is_rootless_podman; then
+      echo "  [i] движок: podman (rootless) — даже root контейнера на хосте лишь твой пользователь"
+      # rootless-лимиты (mem/cpu) работают только на cgroups v2 c systemd-делегированием
+      local cgv; cgv="$(podman info --format '{{.Host.CgroupsVersion}}' 2>/dev/null)"
+      if [ "$cgv" != "v2" ]; then
+        echo "  [!] cgroups ${cgv:-?}: лимиты mem/cpu/pids для rootless НЕ применятся."
+        echo "      Нужны cgroups v2 + systemd. В WSL2: /etc/wsl.conf -> [boot] systemd=true,"
+        echo "      в .wslconfig -> kernelCommandLine = cgroup_no_v1=all, затем wsl --shutdown"; ok=1
+      fi
+    else
+      echo "  [i] движок: podman (ROOT) — rootless-преимущества не задействованы"
+    fi
+  else
+    echo "  [i] движок: docker (демон под root — контейнерный root сильнее, чем в rootless podman)"
+  fi
+
+  # docker.sock / podman.sock — критично
+  if printf '%s' "$cfg" | grep -Eq '(docker|podman)\.sock'; then
+    echo "  [!] сокет контейнерного движка СМОНТИРОВАН — это побег на хост, убери немедленно"; ok=1
+  else
+    echo "  [ok] сокет движка (docker.sock/podman.sock) не монтируется"
+  fi
+  if printf '%s' "$cfg" | grep -Eq 'network_mode:[[:space:]]*host'; then
+    echo "  [!] network_mode: host — общая сеть с хостом"; ok=1
+  else
+    echo "  [ok] нет host-сети"
+  fi
+  if printf '%s' "$cfg" | grep -Eq 'privileged:[[:space:]]*true'; then
+    echo "  [!] privileged: true — контейнер почти равен root на хосте"; ok=1
+  else
+    echo "  [ok] не privileged"
+  fi
+  if printf '%s' "$cfg" | grep -Eq '(pid|ipc|userns_mode):[[:space:]]*host|host.docker.internal|host-gateway'; then
+    echo "  [!] есть host-namespace/host.docker.internal — мостик к хосту"; ok=1
+  else
+    echo "  [ok] нет host-namespaces и host.docker.internal"
+  fi
+
+  # сеть
+  echo "  [i] сеть: полный интернет (агент свободен). host.docker.internal не"
+  echo "      добавлен, но открытые тобой порты на хосте достижимы по gateway-IP."
+
+  # host-маунты: должен быть только проект (rw) и read-only hooks.
+  # Берём source ТОЛЬКО у записей с `type: bind` — иначе в список попадает и
+  # именованный том home (у него в config тоже есть `source: home`).
+  # ВАЖНО: docker compose печатает ключи в порядке type->source, podman-compose
+  # сортирует по алфавиту (source->type) — поэтому собираем пары по элементу
+  # списка, а не по порядку строк.
+  echo "  Маунты с хоста (bind source):"
+  local binds; binds="$(printf '%s\n' "$cfg" | awk '
+      function flush() { if (t == "bind" && s != "") print s; s = ""; t = "" }
+      /^[[:space:]]*-[[:space:]]/ { flush() }
+      {
+        line = $0; sub(/^[[:space:]]*-?[[:space:]]*/, "", line)
+        if (line ~ /^source:/)    { sub(/^source:[[:space:]]*/, "", line); s = line }
+        else if (line ~ /^type:/) { sub(/^type:[[:space:]]*/,   "", line); t = line }
+      }
+      END { flush() }
+    ' | sed "s|^\./|$SCRIPT_DIR/|" | sort -u)"
+  if [ -z "$binds" ]; then
+    echo "    (не удалось разобрать вывод compose config — проверь глазами: ./devstack config)"
+    ok=1
+  else
+    printf '%s\n' "$binds" | sed 's/^/    - /'
+  fi
+  # WSL2: проект не должен лежать на /mnt/c (это диск Windows + дыра в «хост»)
+  if printf '%s' "$binds" | grep -Eq '^/mnt/[a-z]/'; then
+    echo "  [!] один из путей на /mnt/<буква> — это диск Windows. Перенеси проект"
+    echo "      на ext4-ФС WSL2 (напр. ~/code/...): и быстрее, и не светит Windows-FS"; ok=1
+  fi
+  echo "  (норма: только проект -> /workspace, плюс read-only /opt/devstack/hooks)"
+
+  if [ "$ok" = "0" ]; then echo "Критичных проблем не найдено. Единственный мостик к хосту — папка проекта."; else echo "Есть критичные пункты [!] — см. выше." >&2; fi
+}
+
+case "${1:-}" in
+  init)    shift; cmd_init "$@";;
+  up)      require_env; compose up -d --build;;
+  rebuild) require_env; compose build --no-cache && compose up -d;;
+  shell)   require_env; compose exec dev bash;;
+  root)    require_env; shift || true;
+           if [ "$#" -gt 0 ]; then compose exec -u 0 dev "$@"; else compose exec -u 0 dev bash; fi;;
+  down)    require_env; compose down;;
+  check)   cmd_check;;
+  provision) require_env; compose exec dev bash -lc \
+              'set -o pipefail; \
+               [ -n "${DEVSTACK_POSTCREATE:-}" ] || { echo "DEVSTACK_POSTCREATE пуст в .env — нечего запускать" >&2; exit 1; }; \
+               mkdir -p "$HOME/.devstack"; \
+               rm -f "$HOME/.devstack/postcreate.done"; \
+               if ( cd /workspace && bash -lc "$DEVSTACK_POSTCREATE" ) 2>&1 | tee "$HOME/.devstack/postcreate.log"; then \
+                 touch "$HOME/.devstack/postcreate.done"; echo "[devstack] postcreate: готово"; \
+               else \
+                 echo "[devstack] postcreate: ОШИБКА (лог: ~/.devstack/postcreate.log) — сентинел не выставлен, повтор на след. старте" >&2; \
+                 exit 1; \
+               fi';;
+  logs)    require_env; shift || true; compose logs "$@";;
+  config)  require_env; compose config;;
+  ""|-h|--help|help) usage;;
+  *) echo "Неизвестная команда: $1" >&2; usage; exit 2;;
+esac

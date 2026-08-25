@@ -1,0 +1,14 @@
+# Оверлей для ROOTLESS podman. Подключается автоматически из ./devstack
+# (compose()), когда движок — podman и он rootless. Руками не подключать:
+# под docker и под root-podman `userns_mode: keep-id` не поддерживается.
+services:
+  dev:
+    # keep-id: пользователь dev (uid = HOST_UID) внутри контейнера отображается
+    # в ТВОЕГО пользователя на хосте. Без этого rootless-podman отобразил бы
+    # uid 1000 контейнера в subuid (100000+), и файлы, созданные агентом в
+    # /workspace, получали бы на хосте «чужого» владельца.
+    userns_mode: keep-id:uid=${HOST_UID:-1000},gid=${HOST_GID:-1000}
+    # На SELinux-хостах (Fedora/RHEL) bind-маунты без метки блокируются.
+    # В WSL/Ubuntu SELinux нет — строка безвредна, оставлена для переносимости.
+    security_opt:
+      - label=disable

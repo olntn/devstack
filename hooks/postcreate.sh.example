@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Пример многошагового postcreate. Скопируй в postcreate.sh, сделай chmod +x и
+# пропиши в .env:  DEVSTACK_POSTCREATE=bash /opt/devstack/hooks/postcreate.sh
+set -euo pipefail
+cd /workspace
+
+npm ci
+npx playwright install chromium
+# npm run build
+# ./scripts/seed-db.sh
