@@ -122,7 +122,18 @@ RUN set -eux; \
     fi; \
     if ! getent group "${HOST_GID}" >/dev/null; then groupadd -o -g "${HOST_GID}" dev; fi; \
     if id -u dev >/dev/null 2>&1; then \
-        usermod -o -u "${HOST_UID}" -g "${HOST_GID}" -d /home/dev -m -s /bin/bash dev; \
+        # БЕЗ usermod -m: /home/dev к этому моменту уже может существовать —
+        # его создаёт `npm i -g` на слое AI-CLI (там root и ENV HOME=/home/dev).
+        # usermod -m в существующий каталог не умеет и падает с кодом 12
+        # ("directory /home/dev exists"), роняя всю сборку. Поэтому старый home
+        # (напр. /home/node у базы node:*) переносим сами.
+        old_home="$(getent passwd dev | cut -d: -f6 || true)"; \
+        usermod -o -u "${HOST_UID}" -g "${HOST_GID}" -d /home/dev -s /bin/bash dev; \
+        if [ -n "${old_home}" ] && [ "${old_home}" != "/home/dev" ] && [ -d "${old_home}" ]; then \
+            mkdir -p /home/dev; \
+            cp -a "${old_home}/." /home/dev/; \
+            rm -rf "${old_home}"; \
+        fi; \
     else \
         useradd -o -u "${HOST_UID}" -g "${HOST_GID}" -d /home/dev -m -s /bin/bash dev; \
     fi; \
