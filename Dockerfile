@@ -103,6 +103,23 @@ RUN set -eux; \
 # (apt, любые изменения в рантайме). Это БЕЗОПАСНО для хоста, пока снаружи нет
 # мостиков (docker.sock, --privileged, host-namespaces) — см. compose.yaml.
 RUN set -eux; \
+    # Базы node:*, ubuntu:24.04, temurin-*-noble УЖЕ держат uid/gid 1000 (node /
+    # ubuntu). Раньше useradd -o добавлял ВТОРУЮ запись passwd с тем же uid, и
+    # `id`/sudo резолвили uid в ПЕРВОЕ имя (node) — правило sudoers на dev не
+    # срабатывало, и беспарольный sudo молча ломался ("a password is required"),
+    # хотя /etc/sudoers.d/dev на месте. Поэтому занятый uid/gid ПЕРЕИМЕНОВЫВАЕМ
+    # в dev, а не дублируем. Делаем это, только если dev ещё не существует
+    # (иначе usermod -l упал бы на конфликте имён) и uid не root.
+    if [ "${HOST_UID}" != "0" ] && ! id -u dev >/dev/null 2>&1; then \
+        old_grp="$(getent group "${HOST_GID}" | cut -d: -f1 || true)"; \
+        if [ -n "${old_grp}" ] && [ "${old_grp}" != "root" ] && ! getent group dev >/dev/null; then \
+            groupmod -n dev "${old_grp}"; \
+        fi; \
+        old_usr="$(getent passwd "${HOST_UID}" | cut -d: -f1 || true)"; \
+        if [ -n "${old_usr}" ] && [ "${old_usr}" != "root" ]; then \
+            usermod -l dev "${old_usr}"; \
+        fi; \
+    fi; \
     if ! getent group "${HOST_GID}" >/dev/null; then groupadd -o -g "${HOST_GID}" dev; fi; \
     if id -u dev >/dev/null 2>&1; then \
         usermod -o -u "${HOST_UID}" -g "${HOST_GID}" -d /home/dev -m -s /bin/bash dev; \

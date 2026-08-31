@@ -33,9 +33,12 @@
 ```
 
 ## Docker или Podman
-Движок задаётся в `.env`: `CONTAINER_ENGINE=auto|docker|podman` (auto = docker,
-если он установлен, иначе podman). Compose-файлы общие; вся разница спрятана в
-`./devstack`.
+`./devstack init` спрашивает движок отдельным пунктом (и показывает, что реально
+стоит на машине); без вопросов — флаг `--engine auto|docker|podman`. Значение
+попадает в `.env` как `CONTAINER_ENGINE` (auto = podman, если он установлен,
+иначе docker). Compose-файлы общие; вся разница спрятана в `./devstack`.
+Podman идёт первым осознанно — из-за rootless (см. ниже); если при обоих
+установленных нужен именно docker, ставь `CONTAINER_ENGINE=docker`.
 
 Podman-путь:
 - нужен `podman-compose`: `sudo apt install podman podman-compose`
@@ -55,6 +58,12 @@ Podman-путь:
   `./devstack check` проверяет и подсказывает сам.
 - rootless-контейнеры живут в твоей user-сессии: после `wsl --shutdown`
   просто снова `./devstack up`.
+- pod'ы намеренно НЕ используются: podman не принимает `--userns=keep-id`
+  вместе с `--pod` («--userns and --pod cannot be set together»), а сервис у нас
+  один. `./devstack` сам выключает pod с учётом версии podman-compose: до 1.1.0
+  флаг `--in-pod` объявлен как `type=bool`, и `--in-pod false` из-за
+  `bool("false") == True` в Python pod как раз ВКЛЮЧАЕТ — там флаг не
+  передаётся вовсе.
 - миграция с docker: `CONTAINER_ENGINE=podman` в `.env`, затем
   `./devstack rebuild`. Том `home` создастся заново (это подманский том, не
   докерский) — postcreate отработает ещё раз сам.
