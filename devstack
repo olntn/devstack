@@ -31,10 +31,13 @@ compose() {
   # из другого каталога, смонтировал бы чужой ./hooks (или упал). Даём абсолютный
   # путь; для docker compose результат тот же, что и раньше.
   [ -n "$(env_get DEVSTACK_HOOKS_DIR)" ] || export DEVSTACK_HOOKS_DIR="$SCRIPT_DIR/hooks"
-  if [ "$ENGINE" = "podman" ]; then
+  resolve_provider
+  if [ "$PROVIDER" = "podman-compose" ]; then
     command -v podman-compose >/dev/null 2>&1 || {
       echo "CONTAINER_ENGINE=podman, но podman-compose не найден." >&2
       echo "Поставь: sudo apt install podman-compose   (или: pipx install podman-compose)" >&2
+      echo "Либо переключись на настоящий docker compose поверх podman:" >&2
+      echo "  COMPOSE_PROVIDER=docker-compose в .env" >&2
       exit 1
     }
     podman_nopod_args
@@ -42,9 +45,112 @@ compose() {
     # голое "${a[@]}" на пустом массиве считается unbound.
     podman-compose ${PODMAN_NOPOD_ARGS[@]+"${PODMAN_NOPOD_ARGS[@]}"} \
       --env-file "$ENV_FILE" "${files[@]}" "$@"
+  elif [ "$ENGINE" = "podman" ]; then
+    # Настоящий docker compose как фронтенд, podman как рантайм: compose-файл
+    # парсит Docker Compose (то есть совместимость эталонная), а контейнеры
+    # создаёт podman через свой Docker-совместимый API-сокет.
+    resolve_podman_socket
+    DOCKER_HOST="unix://$PODMAN_SOCK" docker compose --env-file "$ENV_FILE" "${files[@]}" "$@"
   else
     docker compose --env-file "$ENV_FILE" "${files[@]}" "$@"
   fi
+}
+
+# Какой compose-фронтенд использовать. Ось отдельная от движка: podman умеет
+# работать и со своим podman-compose, и с настоящим docker compose (через
+# Docker-совместимый сокет). Для docker движка выбора нет.
+PROVIDER=""
+resolve_provider() {
+  [ -n "$PROVIDER" ] && return 0
+  resolve_engine
+  if [ "$ENGINE" != "podman" ]; then PROVIDER="docker-compose"; return 0; fi
+  # Переменная окружения перебивает .env — разовое переключение без правки файла
+  # (нужно, например, чтобы погасить стек старым фронтендом: см. warn_provider_switch).
+  local want; want="${COMPOSE_PROVIDER-}"; [ -n "$want" ] || want="$(env_get COMPOSE_PROVIDER)"
+  want="${want:-auto}"
+  case "$want" in
+    podman-compose|docker-compose) PROVIDER="$want";;
+    auto)
+      # Предпочитаем НАСТОЯЩИЙ docker compose: формат compose определяет он, так
+      # что совместимость эталонная, без клона со своими багами. Откат на
+      # podman-compose — если docker compose или API-сокет недоступны (auto не
+      # имеет права падать: это вывод, а не явный выбор пользователя).
+      if try_podman_socket; then PROVIDER="docker-compose"
+      elif command -v podman-compose >/dev/null 2>&1; then PROVIDER="podman-compose"
+      else PROVIDER="docker-compose"; fi;;  # пусть упадёт с инструкцией из resolve_podman_socket
+    *) echo "COMPOSE_PROVIDER=$want в .env — ожидаю auto|podman-compose|docker-compose" >&2; exit 1;;
+  esac
+  # Стек, поднятый ДРУГИМ фронтендом, для выбранного «ничей» (учёт по разным
+  # меткам). Молча это выглядит как «контейнер пропал» — предупреждаем. Важно и
+  # для явного COMPOSE_PROVIDER, не только для auto.
+  warn_provider_switch
+}
+
+# Живой контейнер помнит, кто его создал: podman-compose ставит метку
+# io.podman.compose.project, docker compose — только com.docker.compose.*.
+# Если фронтенд сменился под уже поднятым стеком, новый его «не видит»: up
+# создаёт второй контейнер / падает на занятом имени, down ничего не находит.
+warn_provider_switch() {
+  local name owner
+  name="$(env_get STACK_NAME)"; name="${name:-devstack}"
+  # Контейнера нет — переключаться не под чем, это чистый старт.
+  podman container exists "$name-dev" 2>/dev/null || return 0
+  owner="$(podman inspect "$name-dev" \
+             --format '{{index .Config.Labels "io.podman.compose.project"}}' 2>/dev/null || true)"
+  if [ -n "$owner" ] && [ "$owner" != "<no value>" ] && [ "$PROVIDER" = "docker-compose" ]; then
+    echo "ВНИМАНИЕ: контейнер $name-dev создан podman-compose, а сейчас выбран docker compose." >&2
+    echo "          Сначала останови стек СТАРЫМ фронтендом, потом поднимай новым:" >&2
+    echo "            COMPOSE_PROVIDER=podman-compose ./devstack down   # или впиши в .env" >&2
+    echo "          Иначе новый фронтенд этот контейнер не увидит." >&2
+  elif { [ -z "$owner" ] || [ "$owner" = "<no value>" ]; } && [ "$PROVIDER" = "podman-compose" ]; then
+    echo "ВНИМАНИЕ: контейнер $name-dev создан docker compose, а сейчас выбран podman-compose." >&2
+    echo "          Останови стек старым фронтендом: COMPOSE_PROVIDER=docker-compose ./devstack down" >&2
+  fi
+}
+
+# Путь к Docker-совместимому сокету podman (для PROVIDER=docker-compose).
+PODMAN_SOCK=""
+podman_socket_path() {
+  local p
+  p="$(podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null || true)"
+  [ -n "$p" ] || p="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+  printf '%s' "$p"
+}
+
+# Мягкая проба: 0 = сокет живой и PODMAN_SOCK заполнен, 1 = нет. Не печатает
+# ошибок и НЕ выходит — используется в auto-выборе провайдера, где неудача это
+# просто повод откатиться на podman-compose.
+try_podman_socket() {
+  [ -n "$PODMAN_SOCK" ] && return 0
+  command -v docker >/dev/null 2>&1 || return 1
+  docker compose version >/dev/null 2>&1 || return 1
+  local p; p="$(podman_socket_path)"
+  # Живость проверяем реальным запросом к API: файл сокета остаётся на месте и
+  # после остановки службы, так что RemoteSocket.Exists врёт.
+  if ! DOCKER_HOST="unix://$p" docker version >/dev/null 2>&1; then
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl --user start podman.socket >/dev/null 2>&1 || true
+    DOCKER_HOST="unix://$p" docker version >/dev/null 2>&1 || return 1
+    echo "[devstack] поднял API-сокет podman (systemctl --user start podman.socket)" >&2
+  fi
+  PODMAN_SOCK="$p"
+}
+
+# Жёсткая версия: провайдер уже выбран, работать без сокета нельзя.
+resolve_podman_socket() {
+  try_podman_socket && return 0
+  if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+    echo "COMPOSE_PROVIDER=docker-compose, но docker CLI с compose v2 не найден." >&2
+    echo "Поставь: sudo apt install docker.io docker-compose-v2" >&2
+    echo "(демон docker при этом НЕ используется — рантайм остаётся podman)" >&2
+    exit 1
+  fi
+  echo "Не отвечает Docker-совместимый сокет podman: $(podman_socket_path)" >&2
+  echo "Подними его одним из способов:" >&2
+  echo "  systemctl --user enable --now podman.socket        # с systemd (обычный путь)" >&2
+  echo "  podman system service --time=0 unix://$(podman_socket_path) &   # без systemd" >&2
+  echo "Либо вернись на podman-compose: COMPOSE_PROVIDER=podman-compose в .env" >&2
+  exit 1
 }
 
 # Как отключить pod у podman-compose. Нам pod не нужен (сервис один), но главное —
@@ -80,7 +186,9 @@ env_get() {
 ENGINE=""
 resolve_engine() {
   [ -n "$ENGINE" ] && return 0
-  local want; want="$(env_get CONTAINER_ENGINE)"; want="${want:-auto}"
+  # Как и COMPOSE_PROVIDER: окружение перебивает .env (разовый прогон другим движком).
+  local want; want="${CONTAINER_ENGINE-}"; [ -n "$want" ] || want="$(env_get CONTAINER_ENGINE)"
+  want="${want:-auto}"
   case "$want" in
     docker|podman) ENGINE="$want";;
     auto)
@@ -135,7 +243,10 @@ devstack v5 — универсальное dev-окружение в конте�
   DEVSTACK_POSTSTART    идемпотентные шаги на КАЖДЫЙ старт
 
 Движок: CONTAINER_ENGINE в .env (auto|docker|podman, дефолт auto = podman,
-если он есть, иначе docker). Podman-путь требует podman-compose; в rootless
+если он есть, иначе docker). Отдельная ось — COMPOSE_PROVIDER: при движке podman
+compose-файл может парсить либо podman-compose, либо НАСТОЯЩИЙ docker compose
+через Docker-совместимый сокет podman (запускает всё равно podman, совместимость
+при этом эталонная — auto предпочитает именно его). В rootless
 автоматически включается keep-id (см. compose.podman.yaml) — файлы в /workspace
 остаются твоими. Rootless-лимиты требуют cgroups v2 (проверка: ./devstack check).
 
@@ -143,6 +254,12 @@ devstack v5 — универсальное dev-окружение в конте�
   --project PATH     путь к проекту на хосте      (дефолт: текущая папка)
   --engine ENGINE    auto | docker | podman; без флага init предложит меню
                      (--yes / не-TTY: auto)
+  --compose-provider P   чем парсить compose при движке podman:
+                     auto | podman-compose | docker-compose (дефолт auto).
+                     docker-compose = настоящий Docker Compose поверх
+                     Docker-совместимого сокета podman (совместимость эталонная).
+                     auto предпочитает его, откатываясь на podman-compose,
+                     если docker compose или сокет недоступны
   --name NAME        имя стека                      (дефолт: имя папки проекта)
   --base IMAGE       базовый образ; без флага init предложит меню
                      (node:22/24-slim, python, temurin-jdk, golang, ubuntu, свой)
@@ -167,12 +284,13 @@ EOF
 }
 
 cmd_init() {
-  local project="" name="" base="" node="" ai="" playwright="0" extra_apt="" postcreate="" yes="0" force="0" engine=""
+  local project="" name="" base="" node="" ai="" playwright="0" extra_apt="" postcreate="" yes="0" force="0" engine="" provider=""
   local codex="" claude_code=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --project) project="$2"; shift 2;;
       --engine) engine="$2"; shift 2;;
+      --compose-provider) provider="$2"; shift 2;;
       --name) name="$2"; shift 2;;
       --base) base="$2"; shift 2;;
       --node) node="$2"; shift 2;;
@@ -258,33 +376,50 @@ cmd_init() {
     if [ "$yes" = "1" ] || [ ! -t 0 ]; then
       engine="auto"
     else
-      local have_d="НЕ найден" have_p="НЕ найден" eng_in=""
+      local have_d="НЕ найден" have_p="НЕ найден" have_pc="НЕ найден" have_dc="НЕ найден" eng_in=""
       command -v docker >/dev/null 2>&1 && have_d="есть"
       command -v podman >/dev/null 2>&1 && have_p="есть"
+      command -v podman-compose >/dev/null 2>&1 && have_pc="есть"
+      docker compose version >/dev/null 2>&1 && have_dc="есть"
       printf 'Контейнерный движок:\n' >&2
       printf '  1) auto — podman, если он есть, иначе docker  (по умолчанию)\n' >&2
-      printf '  2) docker  (на этой машине: %s)\n' "$have_d" >&2
-      printf '  3) podman  (на этой машине: %s; в rootless включается keep-id)\n' "$have_p" >&2
+      printf '  2) docker           (docker: %s, docker compose: %s)\n' "$have_d" "$have_dc" >&2
+      printf '  3) podman + podman-compose   (podman: %s, podman-compose: %s)\n' "$have_p" "$have_pc" >&2
+      printf '  4) podman + НАСТОЯЩИЙ docker compose через API-сокет podman\n' >&2
+      printf '     (podman: %s, docker compose: %s) — файл парсит Docker Compose,\n' "$have_p" "$have_dc" >&2
+      printf '     контейнеры запускает podman: совместимость эталонная\n' >&2
       read -r -p "Выбор [номер, Enter = по умолчанию]: " eng_in || true
       case "${eng_in:-1}" in
         1|auto|"") engine="auto";;
         2|docker)  engine="docker";;
-        3|podman)  engine="podman";;
+        3|podman)  engine="podman"; provider="podman-compose";;
+        4)         engine="podman"; provider="docker-compose";;
         *) echo "Не понял «$eng_in» — беру auto." >&2; engine="auto";;
       esac
     fi
   fi
   case "$engine" in auto|docker|podman) :;; *) echo "--engine $engine — ожидаю auto|docker|podman" >&2; exit 2;; esac
+  provider="${provider:-auto}"
+  case "$provider" in auto|podman-compose|docker-compose) :;;
+    *) echo "--compose-provider $provider — ожидаю auto|podman-compose|docker-compose" >&2; exit 2;; esac
   # Ранние предупреждения: init не падает (движок можно доставить позже), но
   # молчать о заведомо нерабочем выборе — значит отложить ошибку до `up`.
   case "$engine" in
     docker) command -v docker >/dev/null 2>&1 || echo "ВНИМАНИЕ: docker не найден в PATH — ./devstack up упадёт, пока не поставишь." >&2;;
     podman)
       command -v podman >/dev/null 2>&1 || echo "ВНИМАНИЕ: podman не найден в PATH — ./devstack up упадёт, пока не поставишь." >&2
-      command -v podman-compose >/dev/null 2>&1 || {
-        echo "ВНИМАНИЕ: podman-compose не найден — podman-путь без него не работает." >&2
-        echo "          Поставь: sudo apt install podman-compose   (или: pipx install podman-compose)" >&2
-      };;
+      if [ "$provider" = "docker-compose" ]; then
+        docker compose version >/dev/null 2>&1 || {
+          echo 'ВНИМАНИЕ: docker compose (v2) не найден — этот вариант без него не работает.' >&2
+          echo "          Поставь: sudo apt install docker.io docker-compose-v2" >&2
+        }
+      else
+        command -v podman-compose >/dev/null 2>&1 || {
+          echo "ВНИМАНИЕ: podman-compose не найден — podman-путь без него не работает." >&2
+          echo "          Поставь: sudo apt install podman-compose   (или: pipx install podman-compose)" >&2
+          echo "          Либо выбери вариант 4 (podman + настоящий docker compose)." >&2
+        }
+      fi;;
   esac
 
   # Базовый образ: выбор из списка (или свой вариант). Флаг --base пропускает меню.
@@ -350,6 +485,19 @@ PROJECT_DIR=$project
 # Движок: auto (podman, если он есть, иначе docker) | docker | podman.
 # Смена движка = поменять это значение (том home и образ пересоздадутся).
 CONTAINER_ENGINE=$engine
+# Чем парсить compose-файл, когда движок = podman:
+#   podman-compose — родной фронтенд podman (ставится отдельным пакетом);
+#   docker-compose — НАСТОЯЩИЙ docker compose поверх Docker-совместимого сокета
+#                    podman: файл разбирает Docker Compose (совместимость
+#                    эталонная), контейнеры создаёт podman. Нужен активный сокет
+#                    (systemctl --user enable --now podman.socket) и docker CLI;
+#                    демон docker при этом НЕ используется.
+#   auto           — предпочитает docker-compose (совместимость эталонная);
+#                    откат на podman-compose, если docker compose или сокет
+#                    недоступны.
+# ВАЖНО: перед сменой значения останови стек СТАРЫМ провайдером (./devstack down)
+# — учёт контейнеров у них ведётся по разным меткам.
+COMPOSE_PROVIDER=$provider
 HOST_UID=$uid
 HOST_GID=$gid
 BASE_IMAGE=$base
@@ -403,6 +551,11 @@ HOOK
   echo "  база:    $base   node:$node   playwright:$playwright"
   echo "  AI-CLI:  ${cli_list:-—}"
   echo "  движок:  $engine$([ "$engine" = "auto" ] && { resolve_engine; printf ' -> %s' "$ENGINE"; } || true)"
+  resolve_engine
+  if [ "$ENGINE" = "podman" ]; then
+    resolve_provider
+    echo "  compose: $provider -> $PROVIDER$([ "$PROVIDER" = "docker-compose" ] && printf ' (podman через Docker-совместимый сокет)' || true)"
+  fi
   echo "  модель:  внутри свобода (dev + sudo), снаружи хост запечатан"
   echo "Дальше:  ./devstack up && ./devstack shell    (периметр: ./devstack check)"
 }
@@ -421,6 +574,13 @@ cmd_check() {
   # движок
   resolve_engine
   if [ "$ENGINE" = "podman" ]; then
+    resolve_provider
+    if [ "$PROVIDER" = "docker-compose" ]; then
+      echo "  [i] compose: настоящий docker compose -> Docker-совместимый сокет podman."
+      echo "      Сокет живёт НА ХОСТЕ и в контейнер НЕ монтируется (см. пункт про сокет ниже)."
+    else
+      echo "  [i] compose: podman-compose (родной фронтенд)"
+    fi
     if is_rootless_podman; then
       echo "  [i] движок: podman (rootless) — даже root контейнера на хосте лишь твой пользователь"
       # rootless-лимиты (mem/cpu) работают только на cgroups v2 c systemd-делегированием

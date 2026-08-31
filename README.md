@@ -34,6 +34,17 @@ sudo apt install podman podman-compose uidmap
 - версия `podman-compose` из apt (1.0.6) годится: её баг с `--in-pod`
   `./devstack` обходит сам (см. «Docker или Podman»). Новее — `pipx install
   podman-compose`.
+- `podman-compose` можно и не ставить вовсе — и это предпочтительный путь:
+  `auto` сам берёт настоящий `docker compose` (пакет `docker-compose-v2`) как
+  фронтенд, а запускает всё равно podman (см. «Podman + настоящий docker
+  compose»). Для такого набора ставь:
+  ```bash
+  sudo apt install podman uidmap docker.io docker-compose-v2
+  systemctl --user enable --now podman.socket
+  ```
+  Демон docker при этом не используется, но плагин compose приезжает вместе с
+  клиентом. `podman-compose` остаётся запасным вариантом на случай, когда
+  сокета/`docker compose` нет.
 
 **Docker** — Debian/Ubuntu:
 ```bash
@@ -72,7 +83,10 @@ sudo usermod -aG docker "$USER"   # затем перелогиниться (и�
 `./devstack init` спрашивает движок отдельным пунктом (и показывает, что реально
 стоит на машине); без вопросов — флаг `--engine auto|docker|podman`. Значение
 попадает в `.env` как `CONTAINER_ENGINE` (auto = podman, если он установлен,
-иначе docker). Compose-файлы общие; вся разница спрятана в `./devstack`.
+иначе docker). Вторая ось — `COMPOSE_PROVIDER`: чем парсить compose-файл при
+движке podman (auto предпочитает настоящий `docker compose`, см. ниже).
+Compose-файлы общие; вся разница спрятана в `./devstack`. Обе переменные можно
+перебить окружением на один запуск: `COMPOSE_PROVIDER=podman-compose ./devstack down`.
 Podman идёт первым осознанно — из-за rootless (см. ниже); если при обоих
 установленных нужен именно docker, ставь `CONTAINER_ENGINE=docker`.
 
@@ -97,6 +111,46 @@ Podman-путь (что ставить — см. «Что установить»
   флаг `--in-pod` объявлен как `type=bool`, и `--in-pod false` из-за
   `bool("false") == True` в Python pod как раз ВКЛЮЧАЕТ — там флаг не
   передаётся вовсе.
+### Podman + настоящий docker compose (COMPOSE_PROVIDER=docker-compose)
+Третий вариант в меню `./devstack init`: compose-файл парсит **настоящий Docker
+Compose**, а контейнеры создаёт **podman** через свой Docker-совместимый
+API-сокет. Совместимость при этом эталонная — YAML разбирает та самая
+реализация, на которую ориентирован формат, а не подман-овский клон.
+
+```bash
+systemctl --user enable --now podman.socket     # без systemd: podman system service --time=0 unix://$XDG_RUNTIME_DIR/podman/podman.sock &
+./devstack init --engine podman --compose-provider docker-compose --yes
+./devstack up
+```
+`./devstack` сам поднимает сокет (`systemctl --user start podman.socket`), если
+тот не отвечает, и подставляет `DOCKER_HOST` только своим вызовам compose.
+
+- **демон docker НЕ используется**: нужен лишь клиент `docker` + плагин
+  compose v2. Рантайм остаётся podman, rootless — тоже.
+- `userns_mode: keep-id` **работает**: podman принимает его через compat-API и
+  разворачивает в маппинг «container uid 1000 -> ты». Проверено: файл, созданный
+  агентом в `/workspace`, принадлежит тебе; без keep-id запись туда вообще
+  падает с `Permission denied`. Лимиты (`mem`/`cpus`/`pids`/`shm`), `init`,
+  `exec`, `config` тоже доезжают.
+- **сокет остаётся на хосте и в контейнер не монтируется** — периметр не
+  меняется, `./devstack check` это подтверждает отдельной строкой.
+- `docker compose build` тянет BuildKit и запускает его контейнером
+  (`buildx_buildkit_default` + образ `moby/buildkit`) уже внутри podman. Это
+  нормально (кэш сборки лучше), но в `podman ps -a` появляется лишний контейнер.
+- **это выбор `auto` по умолчанию**: если есть podman, `docker compose` и живой
+  сокет — `auto` берёт именно этот путь. Откат на podman-compose происходит,
+  только когда чего-то из трёх нет. Прибить выбор жёстко:
+  `COMPOSE_PROVIDER=podman-compose` в `.env`.
+- **смена провайдера на живом стеке**: сначала `./devstack down` СТАРЫМ
+  провайдером, потом меняй `COMPOSE_PROVIDER`. podman-compose и docker compose
+  ведут учёт по разным меткам, и для нового фронтенда старый контейнер «ничей».
+  `./devstack` это распознаёт (по метке `io.podman.compose.project` на живом
+  контейнере) и предупреждает вместо молчаливого «стек пропал». Переменная
+  окружения перебивает `.env`, так что гасить старый стек удобно разово:
+  ```bash
+  COMPOSE_PROVIDER=podman-compose ./devstack down   # затем обычный ./devstack up
+  ```
+
 - миграция с docker: `CONTAINER_ENGINE=podman` в `.env`, затем
   `./devstack rebuild`. Том `home` создастся заново (это подманский том, не
   докерский) — postcreate отработает ещё раз сам.
