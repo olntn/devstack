@@ -18,6 +18,42 @@
 | `.devcontainer/devcontainer.json` | интеграция с VS Code | нет |
 | `.env` | всё проектное | **да** (генерируется) |
 
+## Что установить
+Хосту нужен только bash и ОДИН из движков. Сам `./devstack` зависимостей не
+имеет. Ставить оба движка не нужно — выбери один.
+
+**Podman (по умолчанию в `auto`)** — Debian/Ubuntu:
+```bash
+sudo apt install podman podman-compose uidmap
+```
+- `podman-compose` — **отдельный пакет**, `apt install podman` его НЕ тянет.
+  Без него `./devstack up` не работает; `./devstack init` предупреждает сразу.
+- `uidmap` даёт `newuidmap`/`newgidmap` — без них rootless не стартует вообще.
+  Проверить, что диапазоны выданы: `grep "^$USER:" /etc/subuid /etc/subgid`
+  (пусто -> `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`).
+- версия `podman-compose` из apt (1.0.6) годится: её баг с `--in-pod`
+  `./devstack` обходит сам (см. «Docker или Podman»). Новее — `pipx install
+  podman-compose`.
+
+**Docker** — Debian/Ubuntu:
+```bash
+sudo apt install docker.io docker-compose-v2
+sudo usermod -aG docker "$USER"   # затем перелогиниться (или: newgrp docker)
+```
+- нужен именно compose **v2** (подкоманда `docker compose`), а не старый
+  `docker-compose`. Пакет `docker-compose-v2` у `docker.io` стоит лишь в
+  `Suggests` — apt его сам НЕ поставит. Проверка: `docker compose version`.
+- без `usermod -aG docker` каждый вызов упрётся в права на сокет.
+- официальный репозиторий Docker вместо `docker.io`: пакеты `docker-ce`,
+  `docker-ce-cli`, `containerd.io`, `docker-compose-plugin`.
+
+**WSL2**: ни Docker Desktop, ни `podman machine` не нужны — оба движка работают
+нативно внутри дистро. Для лимитов `MEM_LIMIT`/`CPUS` в rootless podman
+дополнительно нужны cgroups v2 + systemd (см. «Docker или Podman»).
+
+Проверить, что всё сошлось: `./devstack init` покажет, какие движки найдены, а
+`./devstack check` — периметр уже поднятого стека.
+
 ## Старт
 ```bash
 ./devstack init        # ответить на пару вопросов -> создаст .env
@@ -40,10 +76,7 @@
 Podman идёт первым осознанно — из-за rootless (см. ниже); если при обоих
 установленных нужен именно docker, ставь `CONTAINER_ENGINE=docker`.
 
-Podman-путь:
-- нужен `podman-compose`: `sudo apt install podman podman-compose`
-  (или `pipx install podman-compose`). Podman Desktop / `podman machine`
-  НЕ нужны — внутри WSL-дистро podman работает нативно.
+Podman-путь (что ставить — см. «Что установить»):
 - **rootless — главная причина миграции**: докеровский демон работает под
   root, и root в контейнере == root на хосте (одна дырка в периметре — и всё).
   В rootless podman демона нет вовсе, а «root» контейнера на хосте — всего лишь
