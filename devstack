@@ -91,8 +91,26 @@ resolve_provider() {
 # Если фронтенд сменился под уже поднятым стеком, новый его «не видит»: up
 # создаёт второй контейнер / падает на занятом имени, down ничего не находит.
 warn_provider_switch() {
-  local name owner
+  local name owner net_labels
   name="$(env_get STACK_NAME)"; name="${name:-devstack}"
+
+  # Сеть переживает `podman-compose down` — он её НЕ удаляет (docker compose
+  # удаляет). Оставшаяся сеть ломает потом настоящий docker compose: у неё нет
+  # метки com.docker.compose.network, и он падает с
+  #   "network X was found but has incorrect label com.docker.compose.network"
+  # Через это же спотыкается VS Code Dev Containers: он ходит через
+  # `podman compose`, а тот делегирует настоящему docker-compose.
+  if [ "$PROVIDER" = "docker-compose" ] && podman network exists "$name-net" 2>/dev/null; then
+    net_labels="$(podman network inspect "$name-net" --format '{{json .Labels}}' 2>/dev/null || true)"
+    case "$net_labels" in
+      *com.docker.compose.network*) :;;
+      *)
+        echo "ВНИМАНИЕ: сеть $name-net осталась от podman-compose (при down он её не удаляет)." >&2
+        echo "          docker compose такую сеть не примет — упадёт на 'incorrect label'." >&2
+        echo "          Удали её один раз:  podman network rm $name-net" >&2;;
+    esac
+  fi
+
   # Контейнера нет — переключаться не под чем, это чистый старт.
   podman container exists "$name-dev" 2>/dev/null || return 0
   owner="$(podman inspect "$name-dev" \
@@ -228,6 +246,8 @@ devstack v5 — универсальное dev-окружение в конте�
   config    Показать итоговый compose (полезно для проверки .env)
   provision Перезапустить DEVSTACK_POSTCREATE (сброс «один раз»-сентинела)
   check     Проверить периметр: единственный host-маунт = проект, нет socket и т.п.
+  devcontainer  Перегенерировать .devcontainer/devcontainer.json под текущий .env
+            (init делает это сам; команда нужна, чтобы не перезаписывать .env)
 
 Модель (free-agent): ВНУТРИ контейнера агент свободен — пользователь dev с
 беспарольным sudo, пишет/ставит что угодно в рантайме. СНАРУЖИ хост запечатан:
@@ -523,6 +543,8 @@ CPUS=2
 SHM_SIZE=1g
 EOF
 
+  write_devcontainer
+
   # Папка hooks для многошагового провижининга (монтируется в /opt/devstack/hooks).
   mkdir -p "$SCRIPT_DIR/hooks"
   if [ ! -f "$SCRIPT_DIR/hooks/postcreate.sh.example" ]; then
@@ -562,6 +584,48 @@ HOOK
 
 require_env() {
   [ -f "$ENV_FILE" ] || { echo "Нет .env — сначала ./devstack init" >&2; exit 1; }
+}
+
+# .devcontainer для VS Code. Генерируется, а не лежит в репозитории, потому что
+# список compose-файлов зависит от движка: keep-id-оверлей нужен только rootless
+# podman, docker про userns_mode: keep-id не знает и упадёт.
+# ВАЖНО: в VS Code открывать надо ПАПКУ DEVSTACK, а не папку проекта — проект
+# приезжает внутрь контейнера как /workspace (workspaceFolder), и сам он
+# по-прежнему не модифицируется.
+write_devcontainer() {
+  local name dc_files='"../compose.yaml"'
+  name="$(env_get STACK_NAME)"; name="${name:-devstack}"
+  ENGINE=""; resolve_engine
+  if [ "$ENGINE" = "podman" ] && is_rootless_podman; then
+    dc_files="$dc_files, \"../compose.podman.yaml\""
+  fi
+  if [ "$(env_get DEVSTACK_READONLY_ROOT)" = "1" ]; then
+    dc_files="$dc_files, \"../compose.isolate.yaml\""
+  fi
+  mkdir -p "$SCRIPT_DIR/.devcontainer"
+  cat > "$SCRIPT_DIR/.devcontainer/devcontainer.json" <<EOF
+// Сгенерирован ./devstack (init / devcontainer) — правки перезапишутся.
+// Список dockerComposeFile собран под текущий движок ($ENGINE).
+{
+  "name": "$name",
+  "dockerComposeFile": [$dc_files],
+  "service": "dev",
+  // Проект смонтирован в /workspace — VS Code открывает именно его, хотя сама
+  // папка devstack лежит на хосте отдельно.
+  "workspaceFolder": "/workspace",
+  "remoteUser": "dev",
+  // false: не перебивать CMD/ENTRYPOINT — иначе не отработает провижининг
+  // (entrypoint.sh: DEVSTACK_POSTCREATE/POSTSTART).
+  "overrideCommand": false,
+  // none: закрытие окна VS Code не должно гасить стек — им же управляет
+  // ./devstack up/down, и снаружи в него ходит ./devstack shell.
+  "shutdownAction": "none"
+}
+EOF
+  echo "Готово: $SCRIPT_DIR/.devcontainer/devcontainer.json  (движок: $ENGINE)"
+  if [ "$ENGINE" = "podman" ]; then
+    echo "В VS Code: dev.containers.dockerPath = podman; открывать ПАПКУ DEVSTACK -> Reopen in Container."
+  fi
 }
 
 cmd_check() {
@@ -676,6 +740,7 @@ case "${1:-}" in
                  echo "[devstack] postcreate: ОШИБКА (лог: ~/.devstack/postcreate.log) — сентинел не выставлен, повтор на след. старте" >&2; \
                  exit 1; \
                fi';;
+  devcontainer) require_env; write_devcontainer;;
   logs)    require_env; shift || true; compose logs "$@";;
   config)  require_env; compose config;;
   ""|-h|--help|help) usage;;

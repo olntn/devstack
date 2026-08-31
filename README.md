@@ -15,7 +15,7 @@
 | `Dockerfile` | база + Node + sudo + опц. AI-CLI (codex / claude-code) | нет |
 | `entrypoint.sh` | подготовка HOME + хук проекта | нет |
 | `devstack` | генератор `.env` + обёртка compose | нет |
-| `.devcontainer/devcontainer.json` | интеграция с VS Code | нет |
+| `.devcontainer/devcontainer.json` | интеграция с VS Code (генерируется `init`) | нет |
 | `.env` | всё проектное | **да** (генерируется) |
 
 ## Что установить
@@ -154,8 +154,51 @@ systemctl --user enable --now podman.socket     # без systemd: podman system 
 - миграция с docker: `CONTAINER_ENGINE=podman` в `.env`, затем
   `./devstack rebuild`. Том `home` создастся заново (это подманский том, не
   докерский) — postcreate отработает ещё раз сам.
-- devcontainer: в VS Code укажи в настройках Dev Containers пути
-  `dev.containers.dockerPath=podman` и `dockerComposePath=podman-compose`.
+- devcontainer: см. отдельный раздел «VS Code (Dev Containers)» ниже.
+
+## VS Code (Dev Containers)
+`./devstack init` генерирует `.devcontainer/devcontainer.json` в папке devstack
+(не в проекте — проект по-прежнему не модифицируется). Список
+`dockerComposeFile` собирается под текущий движок, поэтому после смены движка
+файл надо пересобрать:
+```bash
+./devstack devcontainer     # перегенерировать под текущий .env, НЕ трогая .env
+```
+(`init` делает то же самое, но перезаписывает `.env` целиком — для уже
+настроенного стека бери отдельную команду.)
+
+**В VS Code открывать нужно папку devstack**, а не папку проекта: проект приезжает
+внутрь контейнера как `/workspace`, и именно его показывает редактор
+(`workspaceFolder`). Дальше — «Reopen in Container».
+
+С docker всё работает без настроек. Для **podman** нужны три вещи:
+
+1. `dev.containers.dockerPath` = `podman` в настройках VS Code. Больше ничего
+   указывать не надо — расширение само определит podman (по выводу `podman -v`)
+   и добавит `--userns=keep-id`, `--security-opt label=disable` и префикс
+   `localhost/` к образам.
+   **Не** прописывай `dockerComposePath=podman-compose`: расширение всё равно
+   зовёт `podman compose`, а прежний совет из этого README ломал сборку.
+2. Установленный `docker-compose-v2`. `podman compose` — тонкая обёртка, которая
+   делегирует внешнему провайдеру и сама подставляет сокет podman; при наличии
+   `docker-compose` она выбирает именно его (переопределяется переменной
+   `PODMAN_COMPOSE_PROVIDER`).
+3. `COMPOSE_PROVIDER=docker-compose` (или `auto` — он это и выберет). **Это
+   обязательно**, иначе стек и VS Code поднимают его разными фронтендами, и
+   получается конфликт меток:
+   ```
+   network <stack>-net was found but has incorrect label
+   com.docker.compose.network set to "" (expected: "default")
+   ```
+   Причина: `podman-compose` не ставит на сеть метку `com.docker.compose.network`
+   и **не удаляет сеть при `down`** — осиротевшая сеть отравляет всё, что дальше
+   пойдёт через настоящий docker compose. `./devstack` это детектит и
+   подсказывает `podman network rm <stack>-net`.
+
+Контейнер лучше отдать самому VS Code: `./devstack down`, затем «Reopen in
+Container». Контейнеру, поднятому через `./devstack up`, не хватает меток
+`devcontainer.local_folder`, которые расширение ставит только своим —
+подключиться получится, но часть операций его не найдёт.
 
 ## Где лежит home
 Home контейнера (`/home/dev`: VS Code Server, кэши, история, конфиг агента, mise)
