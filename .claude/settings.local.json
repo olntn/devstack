@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(command -v docker podman bwrap)",
+      "Bash(docker --version)",
+      "Bash(podman --version)",
+      "Bash(docker info *)",
+      "Read(//etc/**)"
+    ]
+  }
+}
