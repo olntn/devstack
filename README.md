@@ -58,8 +58,8 @@ devstack -p ~/code/myapp down   # по пути, откуда угодно
 
 | Команда | Что делает |
 |---|---|
-| `setup` | настроить машину (`--report` — только диагностика) |
-| `init` | зарегистрировать проект (флаги: `--base`, `--claude-code`, `--codex`, `--playwright`, `--extra-apt`, `--postcreate`, `--yes`, … — см. `devstack help`) |
+| `setup` | настроить машину (`--report` — только диагностика; в WSL2 ещё `.wslconfig` — см. «Windows (WSL2)») |
+| `init` | зарегистрировать проект (флаги: `--base`, `--claude-code`, `--codex`, `--playwright`, `--extra-apt`, `--postcreate`, `--mem`, `--cpus`, `--yes`, … — см. `devstack help`) |
 | `up` / `down` / `rebuild` | поднять / остановить / пересобрать с нуля |
 | `shell` | bash внутри (dev; `sudo` без пароля = root по требованию) |
 | `root [cmd]` | команда/шелл под root: `devstack root apt install -y htop` |
@@ -133,9 +133,13 @@ COMPOSE_PROVIDER=podman-compose devstack down   # затем обычный devs
 - **не монтируется `docker.sock`/`podman.sock`** (мгновенный побег на хост),
   нет `--privileged`, нет host-namespaces, нет `host.docker.internal`.
 - лимиты `MEM_LIMIT`/`CPUS`/`pids` — против «убежавших» процессов, не про
-  доступ. В rootless нужны cgroups v2 + systemd (в WSL2: `/etc/wsl.conf` →
-  `[boot] systemd=true`, `.wslconfig` → `kernelCommandLine = cgroup_no_v1=all`,
-  затем `wsl --shutdown`; `check` и `setup` подскажут).
+  доступ. Дефолты `init` считает от машины: `MEM_LIMIT` ≈ 2/3 RAM, `CPUS` =
+  ядра минус одно (явно: `--mem`, `--cpus`, потом `devstack env`). Лимит выше
+  реальной памяти — бумажный (первым придёт OOM-killer хоста/VM), `check` на
+  такое ругается. В rootless нужны cgroups v2 + systemd (в WSL2:
+  `/etc/wsl.conf` → `[boot] systemd=true`, `.wslconfig` →
+  `kernelCommandLine = cgroup_no_v1=all`, затем `wsl --shutdown`; `check` и
+  `setup` подскажут, `setup` в WSL2 предложит дописать сам).
 - сеть: полный интернет (агент ставит пакеты), но открытые тобой порты на
   хосте достижимы по gateway-IP — не держи чувствительные сервисы на 0.0.0.0.
 - WSL2: проект держи на ext4 WSL (`~/code/...`), не на `/mnt/c` — `check`
@@ -144,6 +148,32 @@ COMPOSE_PROVIDER=podman-compose devstack down   # затем обычный devs
 Опционально жёстче: `DEVSTACK_READONLY_ROOT=1` в `.env` — read-only корневая
 ФС (рантайм-apt и `npm i -g` перестанут работать; системные пакеты — через
 `EXTRA_APT` + `devstack rebuild`).
+
+## Windows (WSL2)
+
+devstack работает внутри дистро WSL2, а главный потребитель ресурсов на
+Windows — сама VM WSL (`vmmem`): по умолчанию берёт ~50% RAM, после сборок
+держит кэш страниц и не отдаёт его Windows, а vhdx дистро только растёт. Это
+задаёт `%USERPROFILE%\.wslconfig` на Windows-стороне. `devstack setup` находит
+его через `/mnt/c`, показывает текущие значения и предлагает дописать то, чего
+нет (заданное не перезаписывает, бэкап `.wslconfig.devstack-bak` рядом):
+
+| Ключ | Что даёт |
+|---|---|
+| `[wsl2] memory` | потолок VM; рекомендация — до 3/4 RAM Windows, но Windows остаётся не меньше 4 ГиБ (считается от реальной RAM через PowerShell) |
+| `[wsl2] kernelCommandLine = cgroup_no_v1=all` | cgroups v2 для rootless-лимитов (вместе с `[boot] systemd=true` в `/etc/wsl.conf`) |
+| `[experimental] autoMemoryReclaim=gradual` | возвращать Windows кэш страниц VM после простоя (WSL ≥ 2.0) |
+| `[experimental] sparseVhd=true` | vhdx сжимается сам (WSL ≥ 2.0; уже существующий диск: `wsl --manage <дистро> --set-sparse true`) |
+
+Применяется только после полного перезапуска: `wsl --shutdown` в PowerShell.
+Только посмотреть: `devstack setup --report`. Старый WSL без `wsl --version`
+(inbox-версия) ключи `[experimental]` не знает — сначала `wsl --update`.
+
+Лимиты контейнера `init` считает от того, что видит изнутри: в WSL это память
+и ядра VM, то есть реальный потолок. `devstack check` предупредит, если
+`MEM_LIMIT` не меньше памяти VM — такой лимит бумажный, при нехватке первым
+сработает OOM-killer VM. Проект держи на ext4 WSL (`~/code/...`), не на
+`/mnt/c` — `check` предупредит.
 
 ## Провижининг проекта
 
