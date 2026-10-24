@@ -81,7 +81,7 @@ devstack -p ~/code/myapp down   # по пути, откуда угодно
 |---|---|
 | `setup` | настроить машину (`--report` — только диагностика; в WSL2 ещё `.wslconfig` — см. «Windows (WSL2)») |
 | `self-update` | обновить сам `devstack` (`--check` — только сравнить версии, `--force`, `--url`) |
-| `init` | зарегистрировать проект (флаги: `--base`, `--claude-code`, `--codex`, `--playwright`, `--extra-apt`, `--postcreate`, `--mem`, `--cpus`, `--yes`, … — см. `devstack help`) |
+| `init` | зарегистрировать проект (флаги: `--base`, `--claude-code`, `--codex`, `--playwright`, `--extra-apt`, `--postcreate`, `--mem`, `--cpus`, `--ports`, `--yes`, … — см. `devstack help`) |
 | `up` / `down` / `rebuild` | поднять / остановить / пересобрать с нуля |
 | `shell` | bash внутри (dev; `sudo` без пароля = root по требованию) |
 | `root [cmd]` | команда/шелл под root: `devstack root apt install -y htop` |
@@ -154,6 +154,8 @@ COMPOSE_PROVIDER=podman-compose devstack down   # затем обычный devs
 - **home — том движка**, не папка хоста (иначе был бы второй мостик).
 - **не монтируется `docker.sock`/`podman.sock`** (мгновенный побег на хост),
   нет `--privileged`, нет host-namespaces, нет `host.docker.internal`.
+- **порты наружу — только из `PORTS`** и по умолчанию на `127.0.0.1`
+  (см. «Порты наружу»); `check` печатает список и отмечает `0.0.0.0`.
 - лимиты `MEM_LIMIT`/`CPUS`/`pids` — против «убежавших» процессов, не про
   доступ. Дефолты `init` считает от машины: `MEM_LIMIT` ≈ 2/3 RAM, `CPUS` =
   ядра минус одно (явно: `--mem`, `--cpus`, потом `devstack env`). Лимит выше
@@ -196,6 +198,28 @@ Windows — сама VM WSL (`vmmem`): по умолчанию берёт ~50% R
 `MEM_LIMIT` не меньше памяти VM — такой лимит бумажный, при нехватке первым
 сработает OOM-killer VM. Проект держи на ext4 WSL (`~/code/...`), не на
 `/mnt/c` — `check` предупредит.
+
+## Порты наружу
+
+Dev-серверы агента публикуются на хост списком `PORTS` в `.env` (или
+`devstack init --ports "..."`), формы как у compose:
+
+```ini
+PORTS=3000 8080:80 3000-3010 5353:53/udp 0.0.0.0:5173:5173
+```
+
+- Без адреса публикуется на `127.0.0.1`: порт виден только с этой машины, не
+  из локальной сети. В WSL2 Windows достаёт его как `localhost` через
+  localhostForwarding. Наружу в LAN — только явным `0.0.0.0:…`, `check`
+  отметит это как `[!]`.
+- Из `PORTS` генерируется оверлей `compose.ports.yaml` в папке состояния и
+  подключается в `devcontainer.json`. Поменял список — `devstack up`:
+  контейнер пересоздастся, том home останется.
+- Rootless: порты ниже 1024 без `sysctl net.ipv4.ip_unprivileged_port_start`
+  не опубликуются — `check` предупредит.
+- Это единственный путь «снаружи внутрь», и ровно по твоему списку. Общая
+  сеть с хостом (`network_mode: host`) намеренно не предлагается: она открыла
+  бы агенту всё, что слушает `localhost` хоста.
 
 ## Провижининг проекта
 

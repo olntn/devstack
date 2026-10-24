@@ -12,7 +12,7 @@
 # (/workspace). Проверка периметра: `devstack check`.
 set -euo pipefail
 
-DEVSTACK_VERSION="6.4.0"
+DEVSTACK_VERSION="6.5.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 CONFIG_ROOT="${DEVSTACK_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/devstack}"
 PROJECTS_DIR="$CONFIG_ROOT/projects"
@@ -143,6 +143,55 @@ require_env() {
 env_get() {
   [ -f "$ENV_FILE" ] || return 0
   sed -n "s/^$1=//p" "$ENV_FILE" | tail -1
+}
+
+# ---------------------------------------------------------------------------
+# Порты наружу. PORTS в .env — список через пробел/запятую, формы как у compose:
+#   3000 | 8080:80 | 0.0.0.0:3000:3000 | 3000-3010 | 5353:53/udp
+# Без адреса публикуем на 127.0.0.1: «хост запечатан» не должно превращаться в
+# «dev-сервер агента виден всей локальной сети». Явный 0.0.0.0 — осознанный
+# выбор, check его отметит. Список в compose из одной переменной не собрать,
+# поэтому из PORTS генерируется отдельный оверлей compose.ports.yaml.
+# Общую сеть с хостом (network_mode: host) не предлагаем: она открыла бы агенту
+# всё, что слушает localhost хоста.
+# ---------------------------------------------------------------------------
+ports_normalize() { # ports_normalize "3000 8080:80" -> по записи "ip:host:cont[/proto]" на строку; 1 = ошибка (текст в stderr)
+  local spec proto ip hp cp rest p n
+  for spec in $(printf '%s' "$1" | tr ',' ' '); do
+    proto=""
+    case "$spec" in */*) proto="/${spec##*/}"; spec="${spec%/*}";; esac
+    case "$proto" in ""|/tcp|/udp|/sctp) :;;
+      *) echo "PORTS: протокол «${proto#/}» в «$spec$proto» — ожидаю tcp|udp|sctp" >&2; return 1;; esac
+    case "$spec" in *\[*|*\]*) echo "PORTS: IPv6 в квадратных скобках не поддерживается: «$spec»" >&2; return 1;; esac
+    n="$(printf '%s' "$spec" | tr -cd ':' | wc -c | tr -d ' ')"
+    case "$n" in
+      0) ip="127.0.0.1"; hp="$spec"; cp="$spec";;
+      1) ip="127.0.0.1"; hp="${spec%%:*}"; cp="${spec#*:}";;
+      2) ip="${spec%%:*}"; rest="${spec#*:}"; hp="${rest%%:*}"; cp="${rest#*:}";;
+      *) echo "PORTS: не разобрать «$spec» — ожидаю PORT | HOST:CONT | IP:HOST:CONT[/udp]" >&2; return 1;;
+    esac
+    for p in "$hp" "$cp"; do
+      printf '%s' "$p" | grep -Eq '^[0-9]{1,5}(-[0-9]{1,5})?$' \
+        || { echo "PORTS: порт «$p» в «$spec» — число или диапазон a-b (с адресом: IP:HOST:CONT)" >&2; return 1; }
+    done
+    printf '%s' "$ip" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' \
+      || { echo "PORTS: адрес «$ip» в «$spec» — ожидаю IPv4 (127.0.0.1 или 0.0.0.0)" >&2; return 1; }
+    printf '%s:%s:%s%s\n' "$ip" "$hp" "$cp" "$proto"
+  done
+}
+
+write_ports_overlay() { # compose.ports.yaml из PORTS (.env); PORTS пуст — файла нет. Зовётся из compose() и write_devcontainer.
+  local f="$STATE_DIR/compose.ports.yaml" raw list
+  raw="$(env_get PORTS)"
+  if [ -z "$raw" ]; then rm -f "$f"; return 0; fi
+  list="$(ports_normalize "$raw")" || die "Исправь PORTS в .env:  devstack env"
+  {
+    echo "# СГЕНЕРИРОВАН devstack из PORTS в .env — правки перезапишутся. Поменял PORTS -> devstack up."
+    echo "services:"
+    echo "  dev:"
+    echo "    ports:"
+    printf '%s\n' "$list" | sed 's/^/      - "/; s/$/"/'
+  } > "$f"
 }
 
 # ---------------------------------------------------------------------------
@@ -325,6 +374,9 @@ compose() {
   if [ "$(env_get DEVSTACK_READONLY_ROOT)" = "1" ]; then
     files+=(-f "$STATE_DIR/compose.isolate.yaml")
   fi
+  # Порты наружу — оверлей, сгенерированный из PORTS (.env) на каждый вызов.
+  write_ports_overlay
+  [ -f "$STATE_DIR/compose.ports.yaml" ] && files+=(-f "$STATE_DIR/compose.ports.yaml")
   # podman-compose резолвит относительный bind-source от CWD процесса, а не от
   # папки compose-файла — даём абсолютный путь.
   export DEVSTACK_HOOKS_DIR="$STATE_DIR/hooks"
@@ -421,6 +473,10 @@ HOST_UID. COMPOSE_PROVIDER (для podman): auto|podman-compose|docker-compose.
                         (напр. "npm ci && npx playwright install chromium")
   DEVSTACK_POSTSTART    идемпотентные шаги на КАЖДЫЙ старт
 
+Порты наружу (в .env): PORTS="3000 8080:80 3000-3010 5353:53/udp 0.0.0.0:5173:5173"
+  — на хост; без адреса только 127.0.0.1 (не в LAN; в WSL2 Windows видит его как
+  localhost). Поменял список -> devstack up (контейнер пересоздастся).
+
 Флаги init (без флага — вопрос или дефолт):
   --project PATH     путь к проекту              (дефолт: текущая папка)
   --engine ENGINE    auto | docker | podman      (дефолт: auto)
@@ -435,6 +491,7 @@ HOST_UID. COMPOSE_PROVIDER (для podman): auto|podman-compose|docker-compose.
   --postcreate "..." команды инициализации (DEVSTACK_POSTCREATE)
   --mem LIMIT        лимит памяти контейнера (дефолт: 2/3 RAM машины, напр. 10g)
   --cpus N           квота CPU (дефолт: ядра машины минус одно)
+  --ports "..."      порты наружу, через пробел (PORTS: "3000 8080:80 5353:53/udp")
   --extra-apt "..."  доп. apt-пакеты через пробел
   --yes              без вопросов, дефолты
   --force            перезаписать существующий конфиг
@@ -505,7 +562,7 @@ default_cpus() {
 # ---------------------------------------------------------------------------
 cmd_init() {
   local project="" name="" base="" node="" ai="" playwright="0" extra_apt="" postcreate="" yes="0" force="0" engine="" provider=""
-  local mem="" cpus=""
+  local mem="" cpus="" ports=""
   local codex="" claude_code=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -525,6 +582,7 @@ cmd_init() {
       --postcreate) postcreate="$2"; shift 2;;
       --mem) mem="$2"; shift 2;;
       --cpus) cpus="$2"; shift 2;;
+      --ports) ports="$2"; shift 2;;
       --yes|-y) yes="1"; shift;;
       --force|-f) force="1"; shift;;
       *) die "Неизвестный флаг: $1";;
@@ -701,6 +759,8 @@ cmd_init() {
   # Лимиты — от этой машины, не константа (в WSL2 «машина» = VM WSL). Явно: --mem/--cpus.
   [ -n "$mem" ]  || mem="$(default_mem_limit)"
   [ -n "$cpus" ] || cpus="$(default_cpus)"
+  # Порты проверяем сейчас, а не на первом up.
+  [ -z "$ports" ] || ports_normalize "$ports" >/dev/null || die "Исправь --ports (формы: 3000 | 8080:80 | 0.0.0.0:3000:3000 | 5353:53/udp)"
 
   local uid gid; uid="$(id -u)"; gid="$(id -g)"
 
@@ -745,6 +805,10 @@ DEVSTACK_READONLY_ROOT=0
 MEM_LIMIT=$mem
 CPUS=$cpus
 SHM_SIZE=1g
+# Порты наружу (на хост), через пробел: 3000 | 8080:80 | 0.0.0.0:3000:3000 | 3000-3010 | 5353:53/udp.
+# Без адреса — только 127.0.0.1 (не в LAN; в WSL2 Windows видит его как localhost).
+# Поменял -> devstack up (контейнер пересоздастся, том home останется). Проверка: devstack check.
+PORTS=$ports
 EOF
 
   materialize force
@@ -760,6 +824,7 @@ EOF
   echo "  проект:  $project -> /workspace   (единственный мостик к хосту)"
   echo "  база:    $base   node:$node   playwright:$playwright"
   echo "  AI-CLI:  ${cli_list:-—}"
+  echo "  порты:   ${ports:-— (PORTS в .env)}"
   echo "  лимиты:  mem $mem  cpus $cpus   (машина: $(fmt_gib "$(host_mem_mib)") RAM, $(host_cpus) ядер$(in_wsl && printf ' = VM WSL; потолок задаёт .wslconfig: devstack setup --report' || true))"
   echo "  движок:  $engine$([ "$engine" = "auto" ] && { resolve_engine; printf ' -> %s' "$ENGINE"; } || true)"
   resolve_engine
@@ -793,6 +858,9 @@ write_devcontainer() {
   if [ "$(env_get DEVSTACK_READONLY_ROOT)" = "1" ]; then
     dc_files="$dc_files, \"../compose.isolate.yaml\""
   fi
+  # VS Code запускает compose мимо devstack — оверлей портов должен лежать на диске.
+  write_ports_overlay
+  [ -f "$STATE_DIR/compose.ports.yaml" ] && dc_files="$dc_files, \"../compose.ports.yaml\""
   mkdir -p "$STATE_DIR/.devcontainer"
   cat > "$STATE_DIR/.devcontainer/devcontainer.json" <<EOF
 // Сгенерирован devstack (init / devcontainer) — правки перезапишутся.
@@ -933,7 +1001,13 @@ cmd_code() {
 # ---------------------------------------------------------------------------
 cmd_check() {
   require_env
-  local cfg ok=0
+  local cfg ok=0 ports_raw plist=""
+  # PORTS проверяем до compose config: его stderr ниже глушится, а ошибка в
+  # списке портов должна быть видна как есть.
+  ports_raw="$(env_get PORTS)"
+  if [ -n "$ports_raw" ]; then
+    plist="$(ports_normalize "$ports_raw")" || die "Исправь PORTS в .env:  devstack env"
+  fi
   cfg="$(compose config 2>/dev/null)" || die "compose config упал — проверь .env/движок (devstack setup --report)"
 
   echo "Периметр (free-agent: внутри свобода, снаружи хост запечатан):"
@@ -1017,6 +1091,25 @@ cmd_check() {
     echo "      на ext4-ФС WSL2 (напр. ~/code/...): и быстрее, и не светит Windows-FS"; ok=1
   fi
   echo "  (норма: только проект -> /workspace, плюс read-only .../hooks)"
+
+  # Порты наружу — единственный путь «снаружи внутрь», и ровно по списку PORTS.
+  if [ -z "$plist" ]; then
+    echo "  [ok] порты на хост не публикуются (PORTS пуст)"
+  else
+    echo "  Порты на хост (PORTS):"; printf '%s\n' "$plist" | sed 's/^/    - /'
+    if printf '%s\n' "$plist" | grep -q '^0\.0\.0\.0:'; then
+      echo "  [!] есть порты на 0.0.0.0 — их видит вся локальная сеть, не только эта машина."
+      echo "      Без адреса devstack публикует на 127.0.0.1; 0.0.0.0 оставляй только осознанно."; ok=1
+    fi
+    local rootless=0 low
+    { [ "$ENGINE" = "podman" ] && is_rootless_podman; } || { [ "$ENGINE" = "docker" ] && is_rootless_docker; } && rootless=1
+    low="$(printf '%s\n' "$plist" | awk -F: '{ split($2, r, "-"); if (r[1] + 0 < 1024) printf "%s ", $2 }')"
+    if [ "$rootless" = 1 ] && [ -n "$low" ]; then
+      echo "  [!] порты ${low}< 1024 в rootless не опубликуются без sysctl:"
+      echo "      sudo sysctl net.ipv4.ip_unprivileged_port_start=80   (или возьми порт >= 1024)"; ok=1
+    fi
+    in_wsl && echo "  [i] WSL2: 127.0.0.1 внутри VM виден с Windows как localhost (localhostForwarding)"
+  fi
 
   # Лимиты mem/cpu — от «убежавших» процессов. Лимит выше реальной памяти хуже
   # отсутствующего: cgroup не сработает, первым придёт OOM-killer хоста/VM.
