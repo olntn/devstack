@@ -12,7 +12,7 @@
 # (/workspace). Проверка периметра: `devstack check`.
 set -euo pipefail
 
-DEVSTACK_VERSION="6.2.0"
+DEVSTACK_VERSION="6.3.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 CONFIG_ROOT="${DEVSTACK_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/devstack}"
 PROJECTS_DIR="$CONFIG_ROOT/projects"
@@ -369,7 +369,9 @@ devstack v6 — изолированный контейнер для ИИ-аге
 
 Машина (один раз):
   setup     Проверить и настроить движок на этой машине (podman / rootless
-            docker / docker). `setup --report` — только диагностика.
+            docker / docker). В WSL2 ещё .wslconfig: память VM, возврат памяти
+            Windows (autoMemoryReclaim), сжатие vhdx (sparseVhd), cgroups v2.
+            `setup --report` — только диагностика.
 
 Проект:
   init      Зарегистрировать проект (интерактивно или через флаги).
@@ -425,6 +427,8 @@ HOST_UID. COMPOSE_PROVIDER (для podman): auto|podman-compose|docker-compose.
   --ai PKG           доп. npm-пакеты AI-CLI
   --playwright       apt-зависимости Playwright + дефолтный postcreate
   --postcreate "..." команды инициализации (DEVSTACK_POSTCREATE)
+  --mem LIMIT        лимит памяти контейнера (дефолт: 2/3 RAM машины, напр. 10g)
+  --cpus N           квота CPU (дефолт: ядра машины минус одно)
   --extra-apt "..."  доп. apt-пакеты через пробел
   --yes              без вопросов, дефолты
   --force            перезаписать существующий конфиг
@@ -439,10 +443,63 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Ресурсы машины. Лимиты контейнера считаем от неё, а не из константы: лимит
+# больше реальной памяти — бумажный (первым придёт OOM-killer хоста/VM, а не
+# cgroup). В WSL2 «машина» для нас — это VM WSL: её MemTotal/nproc и есть
+# потолок, а задаёт его %USERPROFILE%\.wslconfig на Windows-стороне (см. блок
+# WSL2 ниже и devstack setup).
+# ---------------------------------------------------------------------------
+in_wsl() { grep -qi microsoft /proc/version 2>/dev/null; }
+
+host_mem_mib() { # MemTotal в МиБ (пусто, если /proc/meminfo недоступен)
+  awk '/^MemTotal:/ { printf "%d", $2 / 1024; exit }' /proc/meminfo 2>/dev/null || true
+}
+
+host_cpus() { # число ядер, видимых этой системе (в WSL — vCPU VM)
+  local n; n="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+  case "$n" in ''|*[!0-9]*) n=2;; esac
+  printf '%s' "$n"
+}
+
+fmt_gib() { # fmt_gib <МиБ> -> "7.7 ГиБ"
+  case "${1:-}" in ''|*[!0-9]*) printf '?'; return 0;; esac
+  awk -v m="$1" 'BEGIN { printf "%.1f ГиБ", m / 1024 }'
+}
+
+to_mib() { # to_mib "4g"|"512m"|"1gb"|"2048k" -> МиБ (целое); пусто, если не разобрать
+  printf '%s' "${1:-}" | LC_ALL=C awk '{
+    v = tolower($0); gsub(/[[:space:]]/, "", v); sub(/b$/, "", v)
+    u = substr(v, length(v)); n = v
+    if (u ~ /^[kmgt]$/) n = substr(v, 1, length(v) - 1); else u = ""
+    if (n == "" || n !~ /^[0-9]+(\.[0-9]+)?$/) exit
+    if (u == "k") m = n / 1024; else if (u == "m") m = n; else if (u == "g") m = n * 1024
+    else if (u == "t") m = n * 1048576; else m = n / 1048576
+    printf "%d", m
+  }'
+}
+
+# Дефолты лимитов для init: MEM_LIMIT ≈ 2/3 RAM (вниз до целых ГиБ, минимум 1g),
+# CPUS = все ядра минус одно под хост (на 1–2 ядрах — все). Раньше были
+# константы 4g/2: на ноутбуке с VM в 4 ГиБ лимит 4g бумажный, а на 16 ядрах
+# два ядра душат сборки агента.
+default_mem_limit() {
+  local mib g; mib="$(host_mem_mib)"
+  case "$mib" in ''|*[!0-9]*) printf '4g'; return 0;; esac
+  g=$(( mib * 2 / 3 / 1024 )); [ "$g" -ge 1 ] || g=1
+  printf '%sg' "$g"
+}
+default_cpus() {
+  local n; n="$(host_cpus)"
+  [ "$n" -gt 2 ] && n=$(( n - 1 ))
+  printf '%s' "$n"
+}
+
+# ---------------------------------------------------------------------------
 # init
 # ---------------------------------------------------------------------------
 cmd_init() {
   local project="" name="" base="" node="" ai="" playwright="0" extra_apt="" postcreate="" yes="0" force="0" engine="" provider=""
+  local mem="" cpus=""
   local codex="" claude_code=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -460,6 +517,8 @@ cmd_init() {
       --playwright) playwright="1"; shift;;
       --extra-apt) extra_apt="$2"; shift 2;;
       --postcreate) postcreate="$2"; shift 2;;
+      --mem) mem="$2"; shift 2;;
+      --cpus) cpus="$2"; shift 2;;
       --yes|-y) yes="1"; shift;;
       --force|-f) force="1"; shift;;
       *) die "Неизвестный флаг: $1";;
@@ -633,6 +692,10 @@ cmd_init() {
     postcreate="npm ci && npx playwright install chromium"
   fi
 
+  # Лимиты — от этой машины, не константа (в WSL2 «машина» = VM WSL). Явно: --mem/--cpus.
+  [ -n "$mem" ]  || mem="$(default_mem_limit)"
+  [ -n "$cpus" ] || cpus="$(default_cpus)"
+
   local uid gid; uid="$(id -u)"; gid="$(id -g)"
 
   mkdir -p "$STATE_DIR"
@@ -670,8 +733,11 @@ DEVSTACK_POSTSTART=
 # Изоляция корневой ФС: 0 = ВЫКЛ (по умолчанию — внутри агент свободен),
 # 1 = read-only root (жёстче, но рантайм-apt/npm -g перестанут работать).
 DEVSTACK_READONLY_ROOT=0
-MEM_LIMIT=4g
-CPUS=2
+# Лимиты — от «убежавших» процессов, не про доступ. Дефолты посчитаны от этой
+# машины на init (MEM_LIMIT ≈ 2/3 RAM, CPUS = ядра минус одно). В WSL2 «машина»
+# = VM WSL, её потолок задаёт .wslconfig (devstack setup). Проверка: devstack check.
+MEM_LIMIT=$mem
+CPUS=$cpus
 SHM_SIZE=1g
 EOF
 
@@ -688,6 +754,7 @@ EOF
   echo "  проект:  $project -> /workspace   (единственный мостик к хосту)"
   echo "  база:    $base   node:$node   playwright:$playwright"
   echo "  AI-CLI:  ${cli_list:-—}"
+  echo "  лимиты:  mem $mem  cpus $cpus   (машина: $(fmt_gib "$(host_mem_mib)") RAM, $(host_cpus) ядер$(in_wsl && printf ' = VM WSL; потолок задаёт .wslconfig: devstack setup --report' || true))"
   echo "  движок:  $engine$([ "$engine" = "auto" ] && { resolve_engine; printf ' -> %s' "$ENGINE"; } || true)"
   resolve_engine
   if [ "$ENGINE" = "podman" ]; then
@@ -945,8 +1012,264 @@ cmd_check() {
   fi
   echo "  (норма: только проект -> /workspace, плюс read-only .../hooks)"
 
+  # Лимиты mem/cpu — от «убежавших» процессов. Лимит выше реальной памяти хуже
+  # отсутствующего: cgroup не сработает, первым придёт OOM-killer хоста/VM.
+  local lim_mem lim_cpus lim_mib host_mib ncpu where="машины"
+  in_wsl && where="VM WSL"
+  lim_mem="$(env_get MEM_LIMIT)"; lim_mem="${lim_mem:-4g}"
+  lim_cpus="$(env_get CPUS)"; lim_cpus="${lim_cpus:-2}"
+  lim_mib="$(to_mib "$lim_mem")"; host_mib="$(host_mem_mib)"; ncpu="$(host_cpus)"
+  echo "  Лимиты (от убежавших процессов, не про доступ):"
+  if [ -z "$lim_mib" ] || [ -z "$host_mib" ]; then
+    echo "  [i] mem_limit $lim_mem (не смог сравнить с памятью $where)"
+  elif [ "$lim_mib" -ge "$host_mib" ]; then
+    echo "  [!] MEM_LIMIT=$lim_mem не меньше всей памяти $where ($(fmt_gib "$host_mib")) — лимит бумажный:"
+    echo "      при нехватке первым сработает OOM-killer снаружи контейнера. Уменьши: devstack env"; ok=1
+  else
+    echo "  [ok] mem_limit $lim_mem, память $where: $(fmt_gib "$host_mib")"
+  fi
+  if LC_ALL=C awk -v c="$lim_cpus" -v n="$ncpu" 'BEGIN { exit !(c + 0 > n + 0) }'; then
+    echo "  [!] CPUS=$lim_cpus больше ядер $where ($ncpu) — квота бумажная"; ok=1
+  else
+    echo "  [ok] cpus $lim_cpus из $ncpu ядер"
+  fi
+  in_wsl && echo "  [i] потолок VM WSL (память, ядра) задаёт .wslconfig: devstack setup --report"
+
   if [ "$ok" = "0" ]; then echo "Критичных проблем не найдено. Единственный мостик к хосту — папка проекта."
   else echo "Есть критичные пункты [!] — см. выше." >&2; fi
+}
+
+# ---------------------------------------------------------------------------
+# WSL2 (Windows). Главный потребитель ресурсов на Windows — сама VM WSL (vmmem):
+# по умолчанию берёт ~50% RAM, после сборок держит кэш страниц и не отдаёт его
+# Windows, а vhdx дистро только растёт. Всё это задаёт %USERPROFILE%\.wslconfig
+# на Windows-стороне. Изнутри дистро он доступен через /mnt/c — находим и правим
+# его так же, как settings.json VS Code: бэкап рядом, заданные значения не
+# трогаем, дописываем только отсутствующие. Применяется после `wsl --shutdown`.
+# ---------------------------------------------------------------------------
+win_exe() { # win_exe <имя.exe> <путь-по-умолчанию> -> исполняемый путь; код 1 = interop недоступен
+  if command -v "$1" >/dev/null 2>&1; then printf '%s' "$1"
+  elif [ -x "$2" ]; then printf '%s' "$2"
+  else return 1; fi
+}
+
+win_userprofile() { # -> /mnt/c/Users/<имя> (WSL-путь) или пусто
+  local exe p="" d n=0 found=""
+  if exe="$(win_exe cmd.exe /mnt/c/Windows/System32/cmd.exe)"; then
+    # cmd.exe, запущенный из каталога на ext4, ругается на UNC-путь (в stderr) — безвредно.
+    p="$("$exe" /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r\n' || true)"
+    case "$p" in [A-Za-z]:\\*) p="$(wslpath -u "$p" 2>/dev/null || true)";; *) p="";; esac
+  fi
+  if [ -z "$p" ] || [ ! -d "$p" ]; then
+    # Откат (interop выключен / кириллица в имени): единственный настоящий профиль.
+    for d in /mnt/c/Users/*/; do
+      d="${d%/}"
+      case "$(basename "$d")" in Public|Default|"Default User"|"All Users") continue;; esac
+      [ -d "$d/AppData" ] || continue
+      found="$d"; n=$((n + 1))
+    done
+    p=""; [ "$n" -eq 1 ] && p="$found"
+  fi
+  printf '%s' "$p"
+}
+
+wsl_version() { # -> "2.3.26.0" или пусто (inbox-WSL без --version / interop выключен)
+  local exe; exe="$(win_exe wsl.exe /mnt/c/Windows/System32/wsl.exe)" || return 0
+  # Вывод wsl.exe — UTF-16LE с CRLF: выкидываем NUL-байты, цифры остаются ASCII.
+  "$exe" --version 2>/dev/null | LC_ALL=C tr -d '\r\0' \
+    | LC_ALL=C sed -n 's/.*WSL[^0-9]*\([0-9][0-9.]*\).*/\1/p' | head -1 || true
+}
+
+win_total_ram_mib() { # RAM Windows в МиБ через PowerShell (пара секунд); пусто, если не вышло
+  local exe b ps_cmd
+  exe="$(win_exe powershell.exe /mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe)" || return 0
+  ps_cmd=("$exe" -NoProfile -NonInteractive -Command '(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory')
+  command -v timeout >/dev/null 2>&1 && ps_cmd=(timeout 20 "${ps_cmd[@]}")
+  b="$("${ps_cmd[@]}" 2>/dev/null | tr -d '\r\n[:space:]' || true)"
+  case "$b" in ''|*[!0-9]*) return 0;; esac
+  printf '%d' "$(( b / 1048576 ))"
+}
+
+# .wslconfig — INI: [секция], ключ=значение, комментарии # и ;. Регистр ключей
+# не важен. CRLF и UTF-8 BOM, которые оставляет Блокнот, сохраняем как есть.
+wslconfig_query() { # wslconfig_query <get|has> <файл> <секция> <ключ>
+  [ -f "$2" ] || return 0
+  LC_ALL=C awk -v mode="$1" -v S="$3" -v K="$4" -v bom="$(printf '\357\273\277')" '
+    function trim(x) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", x); return x }
+    BEGIN { s = tolower(S); k = tolower(K) }
+    {
+      line = $0; sub(/\r$/, "", line)
+      if (NR == 1 && index(line, bom) == 1) line = substr(line, length(bom) + 1)
+      if (line ~ /^[[:space:]]*[#;]/) next
+      if (line ~ /^[[:space:]]*\[/) {
+        sec = line; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec)
+        insec = (tolower(sec) == s); next
+      }
+      if (!insec || !index(line, "=")) next
+      key = trim(substr(line, 1, index(line, "=") - 1))
+      if (tolower(key) != k) next
+      if (mode == "has") print "1"; else print trim(substr(line, index(line, "=") + 1))
+      exit
+    }' "$2"
+}
+wslconfig_get() { wslconfig_query get "$@"; }
+wslconfig_has() { [ "$(wslconfig_query has "$@")" = "1" ]; }
+
+wslconfig_set() { # wslconfig_set <файл> <секция> <ключ> <значение> — заменить или дописать
+  local f="$1" has=0 ors=$'\n' tmp
+  [ -f "$f" ] || : > "$f"
+  wslconfig_has "$f" "$2" "$3" && has=1
+  grep -q $'\r' "$f" 2>/dev/null && ors=$'\r\n'
+  tmp="$(mktemp)"
+  LC_ALL=C awk -v S="$2" -v K="$3" -v V="$4" -v has="$has" -v ORS="$ors" -v bom="$(printf '\357\273\277')" '
+    function trim(x) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", x); return x }
+    function out(x) { if (!started && hasbom) printf "%s", bom; started = 1; print x }
+    function flushblank() { while (nblank > 0) { out(""); nblank-- } }
+    BEGIN { s = tolower(S); k = tolower(K) }
+    {
+      line = $0; sub(/\r$/, "", line)
+      if (NR == 1 && index(line, bom) == 1) { hasbom = 1; line = substr(line, length(bom) + 1) }
+      if (line ~ /^[[:space:]]*\[/) {
+        # Конец нашей секции без ключа — дописываем его последним, перед пустыми
+        # строками-разделителем и следующим заголовком.
+        if (insec && !has && !done) { out(K "=" V); done = 1 }
+        flushblank()
+        sec = line; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec)
+        insec = (tolower(sec) == s); out(line); next
+      }
+      if (insec && !has && line ~ /^[[:space:]]*$/) { nblank++; next }
+      flushblank()
+      if (insec && has && line !~ /^[[:space:]]*[#;]/ && index(line, "=")) {
+        key = trim(substr(line, 1, index(line, "=") - 1))
+        if (tolower(key) == k) { out(K "=" V); done = 1; next }
+      }
+      out(line)
+    }
+    END {
+      if (insec && !has && !done) { out(K "=" V); done = 1 }
+      flushblank()
+      if (!done) { if (NR > 0) out(""); out("[" S "]"); out(K "=" V) }
+    }
+  ' "$f" > "$tmp"
+  cat "$tmp" > "$f"; rm -f "$tmp"
+}
+
+WSLCONFIG_FILE=""
+WSL_PLAN=()   # элементы "секция|ключ|значение" — что предлагаем дописать
+wsl_plan_add() { WSL_PLAN+=("$1|$2|$3"); }
+
+wsl_tune_report() { # wsl_tune_report <cg2:0|1> — диагностика WSL2 + план правок .wslconfig
+  local cg2="$1" prof ver ver_ok=0 vm_mib cpus host_mib f item sec key val
+  local mem procs swap kcl amr svhd rec_mib rec
+  WSL_PLAN=(); WSLCONFIG_FILE=""
+  in_wsl || return 0
+  prof="$(win_userprofile)"; ver="$(wsl_version)"
+  if [ -n "$ver" ] && [ "$(printf '%s\n%s\n' 2.0.0 "$ver" | sort -V | head -1)" = "2.0.0" ]; then ver_ok=1; fi
+  vm_mib="$(host_mem_mib)"; cpus="$(host_cpus)"; host_mib="$(win_total_ram_mib)"
+
+  echo "WSL2:"
+  printf '  WSL: %s   VM: %s RAM, %s ядер   Windows: %s RAM\n' \
+    "${ver:-? (старый WSL без --version или interop выключен)}" "$(fmt_gib "$vm_mib")" "$cpus" \
+    "$([ -n "$host_mib" ] && fmt_gib "$host_mib" || printf '? (PowerShell не ответил)')"
+  if [ -z "$prof" ]; then
+    echo "  [!] не нашёл профиль Windows в /mnt/c/Users — .wslconfig проверь сам: %USERPROFILE%\\.wslconfig"
+    return 0
+  fi
+  f="$prof/.wslconfig"; WSLCONFIG_FILE="$f"
+  if [ -f "$f" ]; then echo "  .wslconfig: $f"
+  else echo "  .wslconfig: нет ($f) — VM работает на дефолтах"; fi
+  mem="$(wslconfig_get "$f" wsl2 memory)"; procs="$(wslconfig_get "$f" wsl2 processors)"
+  swap="$(wslconfig_get "$f" wsl2 swap)"; kcl="$(wslconfig_get "$f" wsl2 kernelCommandLine)"
+  amr="$(wslconfig_get "$f" experimental autoMemoryReclaim)"
+  svhd="$(wslconfig_get "$f" experimental sparseVhd)"
+
+  # memory — потолок VM. Не задан — WSL берёт ~50% RAM Windows. Рекомендация:
+  # до 3/4 RAM, но Windows оставить не меньше 4 ГиБ. Считаем ТОЛЬКО от реальной
+  # RAM Windows — оценку по памяти VM в файл не пишем.
+  if [ -n "$mem" ]; then
+    echo "  [ok] [wsl2] memory=$mem"
+    if [ -n "$host_mib" ] && [ -n "$(to_mib "$mem")" ] && [ "$(to_mib "$mem")" -ge "$host_mib" ]; then
+      echo "  [!]  memory не меньше всей RAM Windows ($(fmt_gib "$host_mib")) — самой Windows памяти не останется"
+    fi
+  elif [ -n "$host_mib" ]; then
+    rec_mib=$(( host_mib * 3 / 4 ))
+    [ $(( host_mib - 4096 )) -lt "$rec_mib" ] && rec_mib=$(( host_mib - 4096 ))
+    [ "$rec_mib" -ge 2048 ] || rec_mib=2048
+    rec="$(( rec_mib / 1024 ))GB"
+    echo "  [!]  [wsl2] memory не задан: VM берёт ~50% RAM Windows (сейчас $(fmt_gib "$vm_mib")) -> рекомендую memory=$rec"
+    wsl_plan_add wsl2 memory "$rec"
+  else
+    echo "  [i]  [wsl2] memory не задан: VM берёт ~50% RAM Windows (сейчас $(fmt_gib "$vm_mib")). Задай явно, напр. memory=12GB"
+  fi
+  echo "  [i]  [wsl2] processors=${procs:-не задан (все ядра: $cpus)}   swap=${swap:-не задан (дефолт: 25% памяти VM)}"
+
+  # cgroups v2 для rootless-лимитов: ядру нужен cgroup_no_v1=all (+ systemd=true в /etc/wsl.conf).
+  if [ "$cg2" = 1 ]; then
+    echo "  [ok] cgroups v2 активны"
+  else
+    case " $kcl " in
+      *" cgroup_no_v1=all "*)
+        echo "  [i]  kernelCommandLine уже содержит cgroup_no_v1=all, а cgroups v2 нет:"
+        echo "       нужен ещё [boot] systemd=true в /etc/wsl.conf и полный wsl --shutdown";;
+      *)
+        echo "  [!]  [wsl2] kernelCommandLine без cgroup_no_v1=all — лимиты mem/cpu в rootless не применятся"
+        wsl_plan_add wsl2 kernelCommandLine "${kcl:+$kcl }cgroup_no_v1=all";;
+    esac
+  fi
+
+  # [experimental] — только WSL >= 2.0.0. autoMemoryReclaim: возвращать Windows
+  # кэш страниц VM (gradual — постепенно, после ~5 мин простоя). sparseVhd: vhdx
+  # сжимается сам, а не только растёт.
+  if [ -n "$amr" ]; then echo "  [ok] [experimental] autoMemoryReclaim=$amr"
+  elif [ "$ver_ok" = 1 ]; then
+    echo "  [!]  [experimental] autoMemoryReclaim не задан: после сборок vmmem держит кэш и не отдаёт -> рекомендую gradual"
+    wsl_plan_add experimental autoMemoryReclaim gradual
+  else
+    echo "  [i]  autoMemoryReclaim/sparseVhd требуют WSL 2.0+: обнови (PowerShell: wsl --update) и повтори setup"
+  fi
+  if [ -n "$svhd" ]; then echo "  [ok] [experimental] sparseVhd=$svhd"
+  elif [ "$ver_ok" = 1 ]; then
+    echo "  [!]  [experimental] sparseVhd не задан: vhdx дистро только растёт -> рекомендую true"
+    echo "       (уже существующий диск сжать отдельно: wsl --manage ${WSL_DISTRO_NAME:-<дистро>} --set-sparse true)"
+    wsl_plan_add experimental sparseVhd true
+  fi
+
+  if [ "${#WSL_PLAN[@]}" -gt 0 ]; then
+    echo "  Предлагаю дописать в $f (заданные значения не трогаю, бэкап рядом):"
+    for item in "${WSL_PLAN[@]}"; do
+      IFS='|' read -r sec key val <<<"$item"
+      printf '    [%s] %s=%s\n' "$sec" "$key" "$val"
+    done
+  fi
+}
+
+wsl_tune_apply() { # wsl_tune_apply <yes:0|1> <report:0|1> — записать план в .wslconfig
+  local yes="$1" report="$2" f="$WSLCONFIG_FILE" item sec key val a=""
+  [ -n "$f" ] && [ "${#WSL_PLAN[@]}" -gt 0 ] || return 0
+  if [ "$report" = 1 ]; then
+    echo "Записать рекомендованное в .wslconfig: devstack setup   (без вопросов: --yes)"; return 0
+  fi
+  if [ "$yes" != 1 ] && [ -t 0 ]; then
+    read -r -p "Дописать рекомендованные значения в $f (бэкап рядом)? [Y/n]: " a || true
+    case "${a:-y}" in n|N|no|No|NO) echo "Пропущено — впиши сам (см. выше), затем wsl --shutdown."; return 0;; esac
+  fi
+  if [ -f "$f" ]; then
+    if [ "$(head -c 2 "$f" | od -An -tx1 | tr -d ' \n')" = "fffe" ]; then
+      echo "[!] $f сохранён в UTF-16 — править не рискую. Пересохрани как UTF-8 (Блокнот: Сохранить как -> UTF-8) или впиши сам:" >&2
+      for item in "${WSL_PLAN[@]}"; do
+        IFS='|' read -r sec key val <<<"$item"; printf '    [%s] %s=%s\n' "$sec" "$key" "$val" >&2
+      done
+      return 0
+    fi
+    cp "$f" "$f.devstack-bak"
+  fi
+  for item in "${WSL_PLAN[@]}"; do
+    IFS='|' read -r sec key val <<<"$item"
+    wslconfig_set "$f" "$sec" "$key" "$val"
+  done
+  echo "Готово: $f$([ -f "$f.devstack-bak" ] && printf ' (бэкап: %s.devstack-bak)' "$f" || true)"
+  echo "Применится после ПОЛНОГО перезапуска WSL: закрой окна WSL и VS Code, затем в PowerShell:  wsl --shutdown"
+  echo "(то же изнутри дистро: wsl.exe --shutdown — оборвёт и эту сессию)"
 }
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1308,7 @@ cmd_setup() {
     subuid_ok=1
   fi
   [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ] && cg2=1
-  grep -qi microsoft /proc/version 2>/dev/null && is_wsl=1
+  in_wsl && is_wsl=1
   command -v apt-get >/dev/null 2>&1 && apt_ok=1
 
   yn() { [ "$1" = 1 ] && echo "да" || echo "НЕТ"; }
@@ -993,6 +1316,8 @@ cmd_setup() {
   echo "  docker CLI: $(yn $have_docker)   демон отвечает: $(yn $docker_daemon)   rootless: $(yn $docker_rootless)   compose v2: $(yn $have_compose)"
   echo "  podman: $(yn $have_podman)   podman-compose: $(yn $have_pc)   podman.socket: enabled=$(yn $sock_enabled) active=$(yn $sock_active)"
   echo "  subuid/subgid для $USER: $(yn $subuid_ok)   systemd (user): $(yn $systemd_ok)   cgroups v2: $(yn $cg2)   WSL2: $(yn $is_wsl)"
+  # WSL2: диагностика VM и план правок .wslconfig (сам план применяется ниже).
+  wsl_tune_report "$cg2"
 
   # --- оценка готовности -----------------------------------------------------
   local ready=""
@@ -1008,13 +1333,14 @@ cmd_setup() {
     echo "Готово: рабочий путь уже настроен — $ready. auto его и выберет."
     [ "$ready" = "docker (рутовый)" ] && \
       echo "Хочешь изящнее (без root-демона): devstack setup --engine rootless-docker | --engine podman"
+    wsl_tune_apply "$yes" "$report"
     if [ "$cg2" = 0 ]; then
       echo "ВНИМАНИЕ: cgroups v2 нет — лимиты mem/cpu в rootless не применятся."
-      [ "$is_wsl" = 1 ] && echo "  WSL2: /etc/wsl.conf -> [boot] systemd=true; .wslconfig -> kernelCommandLine = cgroup_no_v1=all; wsl --shutdown"
+      [ "$is_wsl" = 1 ] && echo "  WSL2: /etc/wsl.conf -> [boot] systemd=true; .wslconfig -> kernelCommandLine = cgroup_no_v1=all (см. выше); wsl --shutdown"
     fi
     return 0
   fi
-  [ "$report" = 1 ] && { echo "Рабочий путь не настроен. Запусти: devstack setup"; return 0; }
+  [ "$report" = 1 ] && { wsl_tune_apply "$yes" 1; echo "Рабочий путь не настроен. Запусти: devstack setup"; return 0; }
 
   # --- выбор цели ------------------------------------------------------------
   if [ -z "$target" ]; then
@@ -1136,6 +1462,7 @@ cmd_setup() {
     *) die "--engine $target — ожидаю podman|podman-min|rootless-docker|docker";;
   esac
 
+  wsl_tune_apply "$yes" 0
   if [ "$cg2" = 0 ]; then
     echo "ВНИМАНИЕ: cgroups v2 нет — лимиты mem/cpu/pids в rootless не применятся."
     [ "$is_wsl" = 1 ] && {
