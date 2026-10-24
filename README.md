@@ -17,6 +17,27 @@ install -Dm755 devstack ~/.local/bin/devstack
 
 (если `~/.local/bin` не в PATH — добавь, либо положи в любой каталог из PATH)
 
+## Обновление
+
+```bash
+devstack self-update            # скачать свежий файл из main и подменить себя
+devstack self-update --check    # только сравнить версии
+```
+
+Скачанный файл проверяется перед заменой (shebang, версия, целостность
+вшитых шаблонов, `bash -n`) и подменяется атомарно. Шаблоны проектов
+перегенерируются при следующем запуске; если менялся Dockerfile — нужен
+`devstack rebuild`. Другой источник (форк, своя ветка) — `--url URL` или
+переменная `DEVSTACK_UPDATE_URL`; откат на старшую версию — `--force`.
+
+Альтернатива с историей под рукой — клон плюс симлинк; тогда `self-update`
+делает `git pull --ff-only` в клоне:
+
+```bash
+git clone https://github.com/olntn/devstack ~/code/devstack
+ln -sf ~/code/devstack/devstack ~/.local/bin/devstack
+```
+
 ## Новая машина (один раз)
 
 ```bash
@@ -59,6 +80,7 @@ devstack -p ~/code/myapp down   # по пути, откуда угодно
 | Команда | Что делает |
 |---|---|
 | `setup` | настроить машину (`--report` — только диагностика; в WSL2 ещё `.wslconfig` — см. «Windows (WSL2)») |
+| `self-update` | обновить сам `devstack` (`--check` — только сравнить версии, `--force`, `--url`) |
 | `init` | зарегистрировать проект (флаги: `--base`, `--claude-code`, `--codex`, `--playwright`, `--extra-apt`, `--postcreate`, `--mem`, `--cpus`, `--yes`, … — см. `devstack help`) |
 | `up` / `down` / `rebuild` | поднять / остановить / пересобрать с нуля |
 | `shell` | bash внутри (dev; `sudo` без пароля = root по требованию) |
@@ -74,8 +96,8 @@ devstack -p ~/code/myapp down   # по пути, откуда угодно
 
 - Шаблоны вшиты в сам `devstack` и материализуются в
   `~/.config/devstack/projects/<slug>/` (slug = имя папки + хэш пути).
-  Обновил `devstack` в `~/.local/bin` → шаблоны обновятся сами при следующем
-  запуске (по версии; после обновления обычно нужен `devstack rebuild`).
+  `devstack self-update` (или обновил файл сам) → шаблоны обновятся сами при
+  следующем запуске; после обновления обычно нужен `devstack rebuild`.
 - Всё проектное — в `.env` этой папки (`devstack env`). Compose-файлы и
   Dockerfile не правятся: они генерируются и перезаписываются.
 - Home контейнера (`/home/dev`: кэши, конфиг агента, VS Code Server) — том

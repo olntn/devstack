@@ -12,7 +12,7 @@
 # (/workspace). Проверка периметра: `devstack check`.
 set -euo pipefail
 
-DEVSTACK_VERSION="6.3.0"
+DEVSTACK_VERSION="6.4.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 CONFIG_ROOT="${DEVSTACK_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/devstack}"
 PROJECTS_DIR="$CONFIG_ROOT/projects"
@@ -372,6 +372,12 @@ devstack v6 — изолированный контейнер для ИИ-аге
             docker / docker). В WSL2 ещё .wslconfig: память VM, возврат памяти
             Windows (autoMemoryReclaim), сжатие vhdx (sparseVhd), cgroups v2.
             `setup --report` — только диагностика.
+  self-update  Обновить сам devstack до свежего из репозитория. Симлинк в
+            git-клон -> git pull --ff-only; иначе скачать, проверить и
+            подменить файл. --check: только сравнить версии; --force:
+            переписать и при той же версии (или откатиться); --url URL:
+            другой источник (дефолт: ветка main olntn/devstack; то же через
+            переменную DEVSTACK_UPDATE_URL).
 
 Проект:
   init      Зарегистрировать проект (интерактивно или через флаги).
@@ -1273,6 +1279,132 @@ wsl_tune_apply() { # wsl_tune_apply <yes:0|1> <report:0|1> — записать 
 }
 
 # ---------------------------------------------------------------------------
+# self-update — обновить сам devstack. Он один файл, так что обновление — это
+# заменить его на свежий из репозитория. Поддержаны оба способа установки:
+#   - симлинк ~/.local/bin/devstack -> файл в git-клоне devstack (SELF уже
+#     разрешён через readlink -f): делаем `git pull --ff-only` в клоне;
+#   - копия файла (install -Dm755): скачиваем с DEVSTACK_UPDATE_URL (по
+#     умолчанию ветка main olntn/devstack), проверяем и подменяем атомарно
+#     через mv — bash читает выполняемый скрипт по ходу, перезапись на месте
+#     сломала бы текущий запуск.
+# Доверие — как при первой установке: HTTPS до GitHub, подписи нет.
+# ---------------------------------------------------------------------------
+DEVSTACK_UPDATE_URL_DEFAULT="https://raw.githubusercontent.com/olntn/devstack/main/devstack"
+
+file_version() { # file_version [файл] -> DEVSTACK_VERSION из него (stdin, если без аргумента)
+  sed -n 's/^DEVSTACK_VERSION="\([^"]*\)".*/\1/p' "${1:-/dev/stdin}" 2>/dev/null | head -1
+}
+
+ver_lt() { # ver_lt A B -> 0, если версия A строго меньше B
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
+}
+
+fetch_to() { # fetch_to <url> <файл>
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --proto '=http,https' "$1" -o "$2"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$2" "$1"
+  else
+    die "Нужен curl или wget:  sudo apt install curl"
+  fi
+}
+
+# Установлен ли devstack из git-клона самого репозитория devstack: файл отслежен
+# git'ом, и origin похож на devstack. Иначе (копия в ~/.local/bin, в т.ч. внутри
+# dotfiles-репозитория) — обновляем скачиванием.
+SELF_GIT_TOP=""
+SELF_UPDATE_TMP=""
+self_in_git_clone() {
+  local dir; dir="$(dirname "$SELF")"
+  SELF_GIT_TOP="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$SELF_GIT_TOP" ] || return 1
+  git -C "$dir" ls-files --error-unmatch "$SELF" >/dev/null 2>&1 || return 1
+  case "$(git -C "$dir" remote get-url origin 2>/dev/null)" in *devstack*) return 0;; *) return 1;; esac
+}
+
+after_update() { # after_update <было> <стало>
+  # Штампы версий у проектов сбрасываем: шаблоны перегенерируются при следующем
+  # запуске даже при той же версии (--force / хотфикс без бампа). Хуки
+  # пользователя materialize не трогает.
+  rm -f "$PROJECTS_DIR"/*/.generated-by 2>/dev/null || true
+  if [ "$1" = "$2" ]; then echo "Готово: devstack $2 (версия та же, файл переписан)."
+  else echo "Готово: devstack $1 -> $2."; fi
+  echo "Шаблоны проектов (compose/Dockerfile/entrypoint) обновятся при следующем запуске."
+  echo "Если менялся Dockerfile — пересобери образ: devstack rebuild"
+}
+
+cmd_self_update() {
+  local check=0 force=0 url="${DEVSTACK_UPDATE_URL:-$DEVSTACK_UPDATE_URL_DEFAULT}"
+  local cur="$DEVSTACK_VERSION" dir tmp new before
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check) check=1; shift;;
+      --force|-f) force=1; shift;;
+      --url) url="$2"; shift 2;;
+      *) die "self-update: неизвестный флаг $1 (есть --check, --force, --url URL)";;
+    esac
+  done
+  dir="$(dirname "$SELF")"
+
+  # --- git-клон: обновление = pull --------------------------------------------
+  if self_in_git_clone; then
+    echo "devstack установлен из git-клона: $SELF_GIT_TOP"
+    if [ "$check" = 1 ]; then
+      git -C "$SELF_GIT_TOP" fetch -q || die "git fetch не удался"
+      new="$(git -C "$SELF_GIT_TOP" show '@{u}:devstack' 2>/dev/null | file_version)"
+      # Сравниваем коммиты, а не строку версии: хотфикс без бампа — тоже обновление.
+      local behind; behind="$(git -C "$SELF_GIT_TOP" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo '?')"
+      echo "установлено: $cur   в origin: ${new:-?}   новых коммитов в origin: $behind"
+      if [ "$behind" = 0 ]; then echo "Уже актуально."
+      else echo "Обновить: devstack self-update   (git pull --ff-only в $SELF_GIT_TOP)"; fi
+      return 0
+    fi
+    before="$(git -C "$SELF_GIT_TOP" rev-parse HEAD)"
+    git -C "$SELF_GIT_TOP" pull -q --ff-only \
+      || die "git pull --ff-only не удался: в клоне локальные правки или история разошлась. Разбери сам: cd $SELF_GIT_TOP"
+    if [ "$(git -C "$SELF_GIT_TOP" rev-parse HEAD)" = "$before" ]; then echo "Уже актуально ($cur)."; return 0; fi
+    after_update "$cur" "$(file_version "$SELF")"
+    return 0
+  fi
+
+  # --- копия файла: скачать, проверить, подменить ------------------------------
+  # Временный файл — глобальная переменная: ловушка EXIT срабатывает уже вне
+  # функции, где local-переменных нет (под set -u это была бы ошибка).
+  SELF_UPDATE_TMP="$(mktemp)"; tmp="$SELF_UPDATE_TMP"; trap 'rm -f "${SELF_UPDATE_TMP:-}"' EXIT
+  fetch_to "$url" "$tmp" || die "Не удалось скачать: $url"
+  # Целостность: shebang, версия, маркер конца payload (обрезанная загрузка дала
+  # бы пустые шаблоны), синтаксис.
+  head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || die "Скачанное не похоже на devstack (нет shebang): $url"
+  new="$(file_version "$tmp")"
+  [ -n "$new" ] || die "В скачанном нет DEVSTACK_VERSION — это не devstack: $url"
+  grep -qx '#==FILE:__end__' "$tmp" || die "Скачанный файл обрезан (нет маркера конца шаблонов) — не ставлю"
+  bash -n "$tmp" 2>/dev/null || die "Скачанный файл не проходит bash -n — не ставлю"
+
+  echo "установлено: $cur ($SELF)"
+  echo "доступно:    $new ($url)"
+  if [ "$check" = 1 ]; then
+    if [ "$new" = "$cur" ]; then echo "Уже актуально."
+    elif ver_lt "$new" "$cur"; then echo "В источнике версия СТАРШЕ установленной. Откатиться: devstack self-update --force"
+    else echo "Обновить: devstack self-update"; fi
+    return 0
+  fi
+  if [ "$force" != 1 ]; then
+    if [ "$new" = "$cur" ]; then echo "Уже актуально (переписать той же версией: --force)."; return 0; fi
+    if ver_lt "$new" "$cur"; then
+      die "В источнике $new, а установлена $cur — новее. Откатиться всё равно: devstack self-update --force"
+    fi
+  fi
+  if [ ! -w "$dir" ] || [ ! -w "$SELF" ]; then
+    die "Нет прав на запись в $SELF. Под root:  sudo $SELF self-update"
+  fi
+  cp "$tmp" "$SELF.new"
+  chmod --reference="$SELF" "$SELF.new" 2>/dev/null || chmod 755 "$SELF.new"
+  chmod +x "$SELF.new"
+  mv -f "$SELF.new" "$SELF"
+  after_update "$cur" "$new"
+}
+
+# ---------------------------------------------------------------------------
 # setup — разовая настройка машины (диагностика + guided-фиксы)
 # ---------------------------------------------------------------------------
 cmd_setup() {
@@ -1576,7 +1708,8 @@ main() {
     path)    require_env; echo "$STATE_DIR";;
     list)    cmd_list;;
     rm|remove) cmd_rm "$@";;
-    version) echo "devstack $DEVSTACK_VERSION";;
+    self-update) cmd_self_update "$@";;
+    version) echo "devstack $DEVSTACK_VERSION   (обновить: devstack self-update, проверить: --check)";;
     ""|help) usage;;
     *) echo "Неизвестная команда: $1" >&2; usage; exit 2;;
   esac
