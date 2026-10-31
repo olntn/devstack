@@ -12,7 +12,7 @@
 # (/workspace). Проверка периметра: `devstack check`.
 set -euo pipefail
 
-DEVSTACK_VERSION="6.2.0"
+DEVSTACK_VERSION="6.4.0"
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
 CONFIG_ROOT="${DEVSTACK_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/devstack}"
 PROJECTS_DIR="$CONFIG_ROOT/projects"
@@ -46,7 +46,7 @@ extract_file() { # extract_file <имя> -> stdout
   ' "$SELF"
 }
 
-TEMPLATE_FILES="compose.yaml compose.podman.yaml compose.rootless-docker.yaml compose.isolate.yaml Dockerfile entrypoint.sh"
+TEMPLATE_FILES="compose.yaml compose.podman.yaml compose.rootless-docker.yaml compose.isolate.yaml Dockerfile entrypoint.sh portfwd.py"
 
 materialize() { # разложить шаблоны в STATE_DIR (идемпотентно, по версии)
   local stamp="$STATE_DIR/.generated-by" f force="${1:-}"
@@ -382,14 +382,20 @@ devstack v6 — изолированный контейнер для ИИ-аге
   rebuild   Пересобрать образ с нуля и поднять
   provision Перезапустить DEVSTACK_POSTCREATE (сброс «один раз»-сентинела)
   check     Проверить периметр: единственный host-маунт = проект, нет сокетов
+  doctor    Диагностика связки VS Code <-> движок: dockerPath, endpoint'ы,
+            видимость контейнера, пустые файлы кэша Dev Containers
+  ports     Автопроброс портов (как в VS Code): что проброшено на localhost.
+            Включается галочкой DEVSTACK_AUTOFORWARD=1 в .env (поднимают
+            up/shell, гасит down); разово: ports --start / --stop
   logs      Логи контейнера
   config    Итоговый compose (проверка .env)
   env       Открыть .env проекта в $EDITOR (или показать путь)
   path      Показать папку состояния проекта
   code      Открыть проект в VS Code, донастроив всё автоматически:
-            devcontainer.json под текущий движок + dockerPath=podman в
-            настройках VS Code (с бэкапом). Останется нажать
-            «Reopen in Container».
+            devcontainer.json + dev.containers.dockerPath под ТЕКУЩИЙ движок
+            (docker и podman — симметрично; правка с бэкапом). При известном
+            несовпадении движков — останов с причиной, а не тихий успех.
+            Останется нажать «Reopen in Container».
   devcontainer  Перегенерировать .devcontainer/ под текущий движок
   list      Все зарегистрированные проекты
   rm        Удалить конфиг проекта (синоним: remove; --purge: ещё том home и
@@ -426,6 +432,7 @@ HOST_UID. COMPOSE_PROVIDER (для podman): auto|podman-compose|docker-compose.
   --playwright       apt-зависимости Playwright + дефолтный postcreate
   --postcreate "..." команды инициализации (DEVSTACK_POSTCREATE)
   --extra-apt "..."  доп. apt-пакеты через пробел
+  --autoforward / --no-autoforward автопроброс портов на localhost (DEVSTACK_AUTOFORWARD)
   --yes              без вопросов, дефолты
   --force            перезаписать существующий конфиг
 
@@ -443,7 +450,7 @@ EOF
 # ---------------------------------------------------------------------------
 cmd_init() {
   local project="" name="" base="" node="" ai="" playwright="0" extra_apt="" postcreate="" yes="0" force="0" engine="" provider=""
-  local codex="" claude_code=""
+  local codex="" claude_code="" autoforward=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --project) project="$2"; shift 2;;
@@ -458,6 +465,8 @@ cmd_init() {
       --no-claude-code) claude_code="0"; shift;;
       --ai) ai="$2"; shift 2;;
       --playwright) playwright="1"; shift;;
+      --autoforward) autoforward="1"; shift;;
+      --no-autoforward) autoforward="0"; shift;;
       --extra-apt) extra_apt="$2"; shift 2;;
       --postcreate) postcreate="$2"; shift 2;;
       --yes|-y) yes="1"; shift;;
@@ -614,6 +623,7 @@ cmd_init() {
   if [ "$playwright" = "0" ]; then
     ask_yn playwright "Поставить системные зависимости Playwright?" "0"
   fi
+  [ -n "$autoforward" ] || ask_yn autoforward "Автопроброс портов контейнера на localhost (как в VS Code)?" "0"
 
   # Оба CLI ставятся через npm и требуют Node 22+. Без npm сборка упадёт — ловим заранее.
   if [ "$codex" = "1" ] || [ "$claude_code" = "1" ] || [ -n "$ai" ]; then
@@ -670,6 +680,10 @@ DEVSTACK_POSTSTART=
 # Изоляция корневой ФС: 0 = ВЫКЛ (по умолчанию — внутри агент свободен),
 # 1 = read-only root (жёстче, но рантайм-apt/npm -g перестанут работать).
 DEVSTACK_READONLY_ROOT=0
+# Автопроброс портов (как в VS Code): 1 = всё, что в контейнере слушает TCP-порт,
+# открывается на 127.0.0.1 хоста под тем же номером (занят — следующий).
+# Без пересборки: подхватят devstack up / shell; что проброшено — devstack ports.
+DEVSTACK_AUTOFORWARD=$autoforward
 MEM_LIMIT=4g
 CPUS=2
 SHM_SIZE=1g
@@ -688,6 +702,7 @@ EOF
   echo "  проект:  $project -> /workspace   (единственный мостик к хосту)"
   echo "  база:    $base   node:$node   playwright:$playwright"
   echo "  AI-CLI:  ${cli_list:-—}"
+  echo "  порты:   $([ "$autoforward" = 1 ] && echo 'автопроброс на localhost (devstack ports)' || echo 'без автопроброса (включить: DEVSTACK_AUTOFORWARD=1)')"
   echo "  движок:  $engine$([ "$engine" = "auto" ] && { resolve_engine; printf ' -> %s' "$ENGINE"; } || true)"
   resolve_engine
   if [ "$ENGINE" = "podman" ]; then
@@ -764,9 +779,18 @@ EOF
 
 # ---------------------------------------------------------------------------
 # code — открыть проект в VS Code, донастроив всё, что можно автоматически:
-# перегенерировать devcontainer.json под текущий движок, прописать
-# dev.containers.dockerPath=podman в настройки VS Code (для движка podman),
-# предупредить о конфликте compose-фронтендов, открыть папку состояния.
+# перегенерировать devcontainer.json под текущий движок, привести глобальный
+# dev.containers.dockerPath К ДВИЖКУ ПРОЕКТА, сверить видимость уже запущенного
+# контейнера тем CLI, который достанется VS Code, и открыть папку состояния.
+#
+# dockerPath обязан следовать за движком В ОБЕ СТОРОНЫ. Ключ живёт в User-scope
+# (scope: application) и выбирает CLI, которым расширение ищет контейнеры ЕЩЁ ДО
+# подключения — класть его в devcontainer.json бесполезно. Односторонняя логика
+# «настраиваем только для podman» оставляла после переключения проекта
+# podman -> docker глобальный dockerPath=podman: контейнер работал в docker,
+# а VS Code искал его в podman («podman ps -q» пуст) и не находил.
+# При известном несовпадении code честно останавливается — иначе «Reopen in
+# Container» гарантированно не найдёт контейнер.
 # Единственное, что автоматизировать нельзя, — клик «Reopen in Container».
 # ---------------------------------------------------------------------------
 vscode_settings_file() {
@@ -789,40 +813,217 @@ vscode_settings_file() {
   return 1
 }
 
-ensure_vscode_dockerpath() { # $1 = 1 -> без вопросов
-  local yes="${1:-0}" f cur
-  if ! f="$(vscode_settings_file)"; then
-    echo "Не нашёл settings.json VS Code — добавь в User-настройки вручную:" >&2
-    echo '  "dev.containers.dockerPath": "podman"' >&2
+# Общий JSONC-парсер настроек (python3): settings.json допускает комментарии,
+# поэтому «первая { файла» и «строка с ключом» могут оказаться внутри
+# комментария — размечаем комментарии/строки и работаем только по «коду».
+#   get — печатает значение dev.containers.dockerPath (пусто = не задан);
+#   set — печатает новый текст файла с ключом=<значение> (замена или вставка
+#         после первой « { » вне строк и комментариев); !=0 — не смог.
+vscode_settings_py() { # <get|set> <файл> [<значение>]
+  python3 - "$@" <<'PYEOF'
+import json, re, sys
+op, path = sys.argv[1], sys.argv[2]
+val = sys.argv[3] if len(sys.argv) > 3 else ""
+src = open(path, encoding="utf-8").read()
+n = len(src)
+mask = bytearray(n)          # 0 = код, 1 = комментарий, 2 = строка
+i = 0
+while i < n:
+    c = src[i]
+    if c == '"':
+        j = i + 1
+        while j < n and src[j] != '"':
+            j += 2 if src[j] == "\\" else 1
+        j = min(j, n - 1)
+        for k in range(i, j + 1): mask[k] = 2
+        i = j + 1
+    elif c == "/" and src[i+1:i+2] == "/":
+        j = src.find("\n", i);      j = n if j < 0 else j
+        for k in range(i, j): mask[k] = 1
+        i = j
+    elif c == "/" and src[i+1:i+2] == "*":
+        j = src.find("*/", i + 2);  j = n if j < 0 else j + 2
+        for k in range(i, j): mask[k] = 1
+        i = j
+    else:
+        i += 1
+active = None
+for m in re.finditer(r'"dev\.containers\.dockerPath"\s*:\s*"([^"]*)"', src):
+    if mask[m.start()] == 1:     # закомментированный ключ настройкой не считается
+        continue
+    active = m
+    break
+if op == "get":
+    sys.stdout.write(active.group(1) if active else "")
+    sys.exit(0)
+canon = '"dev.containers.dockerPath": ' + json.dumps(val)
+if active:
+    out = src[:active.start()] + canon + src[active.end():]
+else:
+    k = next((k for k in range(n) if src[k] == "{" and mask[k] == 0), None)
+    if k is None:
+        sys.exit(1)
+    out = src[:k+1] + "\n    " + canon + "," + src[k+1:]
+sys.stdout.write(out)
+PYEOF
+}
+
+vscode_dockerpath_get() { # <файл> -> значение ключа (пусто = не задан/не разобран)
+  [ -f "${1:-}" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    vscode_settings_py get "$1" 2>/dev/null || true
     return 0
   fi
-  if grep -q '"dev\.containers\.dockerPath"' "$f" 2>/dev/null; then
-    cur="$(sed -n 's/.*"dev\.containers\.dockerPath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)"
-    if [ "$cur" = "podman" ]; then
-      echo "[ok] VS Code: dev.containers.dockerPath = podman"
+  # Без python3 — однострочный разбор; закомментированные строки (// ...) не
+  # считаются, иначе примем за настройку выключенный ключ.
+  { grep -v '^[[:space:]]*//' "$1" 2>/dev/null || true; } \
+    | sed -n 's/.*"dev\.containers\.dockerPath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    | head -1
+}
+
+dockerpath_kind() { # <значение dockerPath> -> docker | podman | custom
+  # Пустое значение = ключа нет: расширение по умолчанию использует docker.
+  # Судим по basename: /usr/bin/docker — это docker, а не «чужой путь».
+  local base; base="$(basename "${1:-docker}")"
+  case "$base" in
+    docker|docker.exe)                                echo docker;;
+    podman|podman.exe|podman-remote|podman-remote.exe) echo podman;;
+    *)                                                echo custom;;
+  esac
+}
+
+# Точечная правка settings.json (JSONC): выставить dev.containers.dockerPath.
+# На месте не правим никогда: результат собирается во временный файл РЯДОМ с
+# оригиналом, перечитывается (ключ действительно встал?) и подменяется
+# атомарным mv; оригинал уходит в бэкап *.devstack-bak. При любом сбое
+# оригинал остаётся нетронутым.
+vscode_settings_write() { # <файл> <docker|podman>; 0 = ключ выставлен
+  local f="$1" val="$2" tmp
+  mkdir -p "$(dirname "$f")"
+  tmp="$(mktemp "$(dirname "$f")/.devstack-settings.XXXXXX")" || return 1
+  if [ ! -s "$f" ] || [ "$(tr -d ' \t\r\n' < "$f")" = "{}" ]; then
+    printf '{\n    "dev.containers.dockerPath": "%s"\n}\n' "$val" > "$tmp"
+  elif command -v python3 >/dev/null 2>&1; then
+    vscode_settings_py set "$f" "$val" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  else
+    # Нет python3 — запасной путь: замена значения только при однозначно
+    # читаемом ключе; вставка — после первой «{» ВНЕ строк-комментариев
+    # (строки, начинающиеся с // или /*, пропускаем — иначе ключ ляжет в
+    # комментарий или перед объектом). Промах отловит проверка ниже.
+    if { grep -v '^[[:space:]]*//' "$f" || true; } | grep -q '"dev\.containers\.dockerPath"'; then
+      [ -n "$(vscode_dockerpath_get "$f")" ] || { rm -f "$tmp"; return 1; }
+      sed 's/"dev\.containers\.dockerPath"[[:space:]]*:[[:space:]]*"[^"]*"/"dev.containers.dockerPath": "'"$val"'"/' "$f" > "$tmp"
     else
-      echo "[!] VS Code: dev.containers.dockerPath = «$cur» — чужое значение не перезаписываю." >&2
-      echo "    Поменяй на podman сам: $f" >&2
+      awk -v v="$val" '
+        !done {
+          s = $0; sub(/^[[:space:]]*/, "", s)
+          if (substr(s, 1, 2) != "//" && substr(s, 1, 2) != "/*" && (i = index($0, "{")) > 0) {
+            print substr($0, 1, i)
+            print "    \"dev.containers.dockerPath\": \"" v "\","
+            if (length($0) > i) print substr($0, i + 1)
+            done = 1; next
+          }
+        }
+        { print }' "$f" > "$tmp"
     fi
+  fi
+  if [ "$(vscode_dockerpath_get "$tmp")" != "$val" ]; then
+    rm -f "$tmp"; return 1
+  fi
+  chmod --reference="$f" "$tmp" 2>/dev/null || chmod 644 "$tmp" 2>/dev/null || true
+  if [ -f "$f" ]; then cp "$f" "$f.devstack-bak" || { rm -f "$tmp"; return 1; }; fi
+  mv -f "$tmp" "$f"
+}
+
+# Привести dev.containers.dockerPath к движку проекта — СИММЕТРИЧНО для docker
+# и podman. Меняем (с вопросом) только «свой» класс значений — литеральные
+# docker/podman и отсутствующий ключ; явный пользовательский путь не трогаем.
+# Коды возврата:
+#   0 — настройка совпадает с движком (или только что приведена к нему);
+#   1 — известное несовпадение осталось (отказ пользователя / чужой путь);
+#   2 — проверить не удалось (нет settings.json / нестандартный wrapper).
+ensure_vscode_engine() { # <движок> [<1 = без вопросов>]
+  local engine="$1" yes="${2:-0}" f cur kind
+  if ! f="$(vscode_settings_file)"; then
+    echo "Не нашёл settings.json VS Code — проверь User-настройки сам:" >&2
+    if [ "$engine" = "podman" ]; then
+      echo '  нужно  "dev.containers.dockerPath": "podman"' >&2
+    else
+      echo '  ключа "dev.containers.dockerPath" быть не должно (либо "docker")' >&2
+    fi
+    echo "  (нестандартный путь к настройкам: переменная DEVSTACK_VSCODE_SETTINGS)" >&2
+    return 2
+  fi
+  cur="$(vscode_dockerpath_get "$f")"
+  # Ключ упомянут, а значение не разобралось (например, многострочное
+  # форматирование без python3 в PATH) — не притворяемся, что его нет.
+  if [ -z "$cur" ] \
+     && { grep -v '^[[:space:]]*//' "$f" 2>/dev/null || true; } | grep -q '"dev\.containers\.dockerPath"'; then
+    echo "[?] В настройках есть dev.containers.dockerPath, но значение я не разобрал." >&2
+    echo "    Проверь руками, что оно соответствует движку $engine: $f" >&2
+    return 2
+  fi
+  kind="$(dockerpath_kind "$cur")"
+  if [ "$kind" = "$engine" ]; then
+    echo "[ok] VS Code: dev.containers.dockerPath = ${cur:-<не задан, дефолт docker>} — совпадает с движком ($engine)"
     return 0
   fi
-  echo "VS Code ещё не настроен на podman — без этого он смотрит в docker-демон"
-  echo "и не видит podman-контейнеров. Добавляю \"dev.containers.dockerPath\": \"podman\" в:"
+  if [ "$kind" = "custom" ]; then
+    echo "[?] VS Code: dev.containers.dockerPath = «$cur» — нестандартный CLI, не трогаю" >&2
+    echo "    и проверить не могу. Проект работает на $engine — убедись, что «$cur»" >&2
+    echo "    ходит именно в него ($f)." >&2
+    return 2
+  fi
+  # Несовпадение docker <-> podman. Литералы (и отсутствующий ключ) devstack
+  # выставляет сам — их можно и переключать; явный путь — только руками.
+  case "$cur" in
+    ""|docker|podman) ;;
+    *)
+      echo "[!] Проект работает на $engine, а VS Code настроен на «$cur»." >&2
+      echo "    Путь задан явно — не перезаписываю. Поменяй сам: $f" >&2
+      return 1;;
+  esac
+  echo "VS Code сейчас ходит в ${cur:-docker (дефолт расширения)}, а проект работает на $engine —"
+  echo "контейнер не появится в списке Dev Containers. Меняю \"dev.containers.dockerPath\" -> \"$engine\" в:"
   echo "  $f"
   if [ "$yes" != 1 ] && [ -t 0 ]; then
     local a=""; read -r -p "Продолжить? [Y/n]: " a || true
-    case "${a:-y}" in n|N|no|No|NO) echo "Пропущено."; return 0;; esac
+    case "${a:-y}" in n|N|no|No|NO)
+      echo "Пропущено — несовпадение осталось (движок $engine, VS Code ${cur:-docker})." >&2
+      return 1;;
+    esac
   fi
-  mkdir -p "$(dirname "$f")"
-  if [ ! -s "$f" ] || [ "$(tr -d ' \t\r\n' < "$f")" = "{}" ]; then
-    printf '{\n    "dev.containers.dockerPath": "podman"\n}\n' > "$f"
-  else
-    cp "$f" "$f.devstack-bak"
-    # settings.json — это JSONC (комментарии разрешены), полноценный парсер не
-    # обязателен: вставляем ключ сразу после первой «{». Бэкап — рядом.
-    sed -i '0,/{/s//{\n    "dev.containers.dockerPath": "podman",/' "$f"
+  if vscode_settings_write "$f" "$engine"; then
+    echo "Готово (бэкап: $f.devstack-bak). Перезапусти окно VS Code (Reload Window)."
+    return 0
   fi
-  echo "Готово (бэкап: $f.devstack-bak). Перезапусти окно VS Code (Reload Window)."
+  echo "[!] Не смог безопасно поправить $f — добавь вручную:" >&2
+  echo "      \"dev.containers.dockerPath\": \"$engine\"" >&2
+  return 1
+}
+
+# Если стек уже поднят — до открытия редактора сверить, что CLI, которым будет
+# пользоваться VS Code, видит именно НАШ контейнер. Сравниваем полный ID:
+# одноимённые контейнеры могут жить в обоих движках одновременно.
+check_vscode_container_access() { # <CLI для VS Code>; 0 = ок или проверять нечего
+  local cli="$1" name cid list
+  name="$(env_get STACK_NAME)"; name="${name:-devstack}"
+  cid="$({ "$ENGINE" container inspect --format '{{.Id}} {{.State.Running}}' "$name-dev" 2>/dev/null || true; } \
+        | awk '$2 == "true" { print $1 }')"
+  [ -n "$cid" ] || return 0   # стек не поднят — Reopen поднимет его сам, сверять нечего
+  list="$("$cli" ps -q --no-trunc 2>/dev/null)" || {
+    echo "[?] «$cli ps» не отработал — видимость контейнера не проверить." >&2
+    return 0
+  }
+  if printf '%s\n' "$list" | grep -qx "$cid"; then
+    echo "[ok] CLI VS Code ($cli) видит контейнер $name-dev (${cid:0:12})"
+    return 0
+  fi
+  echo "[!] Контейнер $name-dev запущен в $ENGINE (${cid:0:12}), но «$cli ps» его НЕ видит." >&2
+  echo "    VS Code будет искать контейнер не в том движке. Проверь" >&2
+  echo "    dev.containers.dockerPath и docker context (docker context show);" >&2
+  echo "    подробная картина: devstack doctor" >&2
+  return 1
 }
 
 cmd_code() {
@@ -836,13 +1037,30 @@ cmd_code() {
   require_env
   write_devcontainer
   resolve_engine
+  # Интеграция с VS Code проверяется для ОБОИХ движков (симметрично).
+  local rc=0 f vcli=""
+  ensure_vscode_engine "$ENGINE" "$yes" || rc=$?
+  if [ "$rc" = 1 ]; then
+    die "Останов: проект работает на $ENGINE, а VS Code настроен на другой движок —
+после «Reopen in Container» контейнер не найдётся. Исправь настройку (см. выше) и повтори."
+  fi
+  [ "$rc" = 2 ] && echo "Продолжаю, но настройку VS Code проверить не удалось (см. выше)." >&2
   if [ "$ENGINE" = "podman" ]; then
-    ensure_vscode_dockerpath "$yes"
     resolve_provider
     if [ "$PROVIDER" = "podman-compose" ]; then
       echo "ВНИМАНИЕ: у проекта COMPOSE_PROVIDER=podman-compose, а VS Code ходит через" >&2
       echo "          настоящий docker compose — получится конфликт меток. Перед Reopen:" >&2
       echo "            devstack down; затем COMPOSE_PROVIDER=auto в devstack env" >&2
+    fi
+  fi
+  # Контрольная сверка: если контейнер уже работает, тот ли его увидит VS Code?
+  # Только при найденных настройках — иначе CLI VS Code неизвестен и блокировать
+  # запуск по догадке нельзя.
+  if f="$(vscode_settings_file)"; then
+    vcli="$(vscode_dockerpath_get "$f")"; vcli="${vcli:-docker}"
+    if command -v "$vcli" >/dev/null 2>&1; then
+      check_vscode_container_access "$vcli" \
+        || die "Останов: VS Code не увидит запущенный контейнер (см. выше)."
     fi
   fi
   if command -v code >/dev/null 2>&1; then
@@ -853,6 +1071,246 @@ cmd_code() {
   else
     echo "CLI «code» не найден в PATH — открой папку в VS Code вручную: $STATE_DIR"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# doctor — диагностика связки VS Code <-> движок. Ничего не чинит, только
+# показывает фактическое состояние каждого звена цепочки: движок проекта ->
+# dockerPath -> endpoint -> контейнер -> кэш Dev Containers. Восстановление
+# кэша — отдельное осознанное действие пользователя, не побочный эффект up.
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --vscode) shift;;   # пока единственный (и дефолтный) раздел
+      *) die "doctor: неизвестный флаг $1 (есть --vscode)";;
+    esac
+  done
+  # Проект опционален: без него пропускаем только раздел контейнера.
+  if [ -z "$ENV_FILE" ]; then select_project "$PROJECT_ARG" 2>/dev/null || true; fi
+  local have_env=""
+  [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ] && have_env=1
+
+  echo "== Проект =="
+  local engine="" provider="" name=""
+  # resolve_* могут die (нет движков / кривой .env) — die в subshell гасится,
+  # а «|| true» снаружи подстановки не даёт errexit'у убить doctor.
+  engine="$( { ENGINE=""; resolve_engine >/dev/null 2>&1 && printf '%s' "$ENGINE"; } 2>/dev/null )" || true
+  if [ -n "$have_env" ]; then
+    name="$(env_get STACK_NAME)"; name="${name:-devstack}"
+    echo "  стек: $name  ($STATE_DIR)"
+    echo "  CONTAINER_ENGINE в .env: $(env_get CONTAINER_ENGINE | grep . || echo auto)"
+  else
+    echo "  проект не найден (запусти из папки проекта или devstack -p ...) —"
+    echo "  раздел «Контейнер» пропущу."
+  fi
+  if [ -n "$engine" ]; then
+    ENGINE="$engine"
+    echo "  движок: $engine"
+    if [ "$engine" = "podman" ]; then
+      provider="$( { PROVIDER=""; resolve_provider >/dev/null 2>&1 && printf '%s' "$PROVIDER"; } 2>/dev/null )" || true
+      echo "  compose-фронтенд: ${provider:-не определился}"
+    fi
+  else
+    echo "  движок: не определился (нет ни docker, ни podman?)"
+  fi
+
+  echo "== VS Code =="
+  local f cur kind vcli=""
+  if f="$(vscode_settings_file)"; then
+    echo "  settings.json: $f"
+    cur="$(vscode_dockerpath_get "$f")"
+    kind="$(dockerpath_kind "$cur")"
+    vcli="${cur:-docker}"
+    echo "  dev.containers.dockerPath: ${cur:-<не задан, дефолт docker>}"
+    if [ -n "$engine" ]; then
+      if [ "$kind" = "$engine" ]; then
+        echo "  соответствие движку: ok"
+      elif [ "$kind" = "custom" ]; then
+        echo "  соответствие движку: НЕИЗВЕСТНО (нестандартный CLI «$cur»)"
+      else
+        echo "  соответствие движку: НЕСОВПАДЕНИЕ — проект на $engine, VS Code на $kind"
+        echo "    лечится: devstack code  (предложит поправить с бэкапом)"
+      fi
+    fi
+  else
+    echo "  settings.json: не нашёл (подскажи путь через DEVSTACK_VSCODE_SETTINGS)"
+  fi
+  [ -n "${DOCKER_HOST:-}" ] && echo "  DOCKER_HOST: $DOCKER_HOST"
+  if command -v docker >/dev/null 2>&1; then
+    local ctx="" ep=""
+    ctx="$(docker context show 2>/dev/null)" || true
+    [ -n "$ctx" ] && ep="$(docker context inspect --format '{{.Endpoints.docker.Host}}' "$ctx" 2>/dev/null)" || true
+    echo "  docker context: ${ctx:-?}  (${ep:-endpoint неизвестен})"
+  else
+    echo "  docker CLI: нет в PATH"
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    if try_podman_socket; then
+      echo "  podman socket: $PODMAN_SOCK (живой)"
+    else
+      echo "  podman socket: не отвечает (для VS Code+podman нужен:"
+      echo "    systemctl --user enable --now podman.socket)"
+    fi
+  else
+    echo "  podman CLI: нет в PATH"
+  fi
+
+  if [ -n "$have_env" ] && [ -n "$engine" ]; then
+    echo "== Контейнер =="
+    local cid=""
+    cid="$({ "$engine" container inspect --format '{{.Id}} {{.State.Running}}' "$name-dev" 2>/dev/null || true; } \
+          | awk '$2 == "true" { print $1 }')"
+    if [ -n "$cid" ]; then
+      echo "  $name-dev в $engine: запущен (${cid:0:12})"
+      if [ -n "$vcli" ] && command -v "$vcli" >/dev/null 2>&1; then
+        local list
+        if list="$("$vcli" ps -q --no-trunc 2>/dev/null)"; then
+          if printf '%s\n' "$list" | grep -qx "$cid"; then
+            echo "  виден CLI VS Code ($vcli): да"
+          else
+            echo "  виден CLI VS Code ($vcli): НЕТ — вот почему «контейнер не найден»"
+          fi
+        else
+          echo "  «$vcli ps» не отработал — видимость не проверить"
+        fi
+      fi
+    else
+      echo "  $name-dev в $engine: не запущен (это норма перед Reopen in Container)"
+    fi
+  fi
+
+  echo "== Кэш Dev Containers (WSL/Linux) =="
+  # Расширение проверяет только СУЩЕСТВОВАНИЕ кэшированных файлов, не содержимое:
+  # обнулённый файл (например, после жёсткого завершения WSL) считается
+  # установленным и не перекачивается — отсюда «stream ended with:0» и
+  # ERR_INVALID_PACKAGE_CONFIG. Ищем пустые файлы, чинить их — руками.
+  local d empties="" cnt=0
+  for d in "$HOME/.vscode-server/extensions" "$HOME/.vscode-remote-containers"; do
+    [ -d "$d" ] || continue
+    empties="$empties$(find "$d" -path '*remote-containers*' -type f -size 0 2>/dev/null)"$'\n'
+  done
+  empties="$(printf '%s' "$empties" | grep . || true)"
+  if [ -z "$empties" ]; then
+    if [ -d "$HOME/.vscode-server" ] || [ -d "$HOME/.vscode-remote-containers" ]; then
+      echo "  пустых файлов не найдено"
+    else
+      echo "  кэша нет (VS Code сюда ещё не подключался) — проверять нечего"
+    fi
+  else
+    cnt="$(printf '%s\n' "$empties" | wc -l)"
+    echo "  ПУСТЫЕ файлы ($cnt) — расширение сочтёт их установленными и само не восстановит:"
+    printf '%s\n' "$empties" | head -20 | sed 's/^/    /'
+    [ "$cnt" -gt 20 ] && echo "    ... и ещё $((cnt - 20))"
+    echo "  Починка (закрой окна VS Code):"
+    echo "    rm -rf ~/.vscode-remote-containers            # кэш CLI — пересоздастся"
+    echo "    пустые файлы в ~/.vscode-server/extensions/ — переустанови расширение в WSL"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# ports — автопроброс портов (DEVSTACK_AUTOFORWARD=1 в .env), как в VS Code:
+# всё, что внутри контейнера слушает TCP-порт, появляется на 127.0.0.1:<порт>
+# хоста (занят — следующий свободный). Движок портов НЕ публикует и compose не
+# меняется: фоновый процесс на хосте (portfwd.py, один на проект) держит один
+# `<движок> exec -i` в контейнер и гонит соединения через него. Поэтому
+# достижим и сервис, слушающий 127.0.0.1 внутри (vite, codex login), а новый
+# порт не требует пересоздания контейнера.
+# Жизненный цикл: up/rebuild/shell поднимают форвардер (если стоит галочка),
+# down/rm гасят; перезапуск контейнера он переживает, а если контейнер не
+# запущен 10 минут — выходит сам.
+# ---------------------------------------------------------------------------
+autoforward_enabled() {
+  # Окружение перебивает .env (разовый прогон: DEVSTACK_AUTOFORWARD=0 devstack up).
+  local v; v="${DEVSTACK_AUTOFORWARD-}"; [ -n "$v" ] || v="$(env_get DEVSTACK_AUTOFORWARD)"
+  [ "$v" = "1" ]
+}
+
+portfwd_pid() { # -> pid форвардера этого проекта; !=0 — не работает
+  local pid
+  pid="$(cut -d' ' -f1 "$STATE_DIR/.portfwd.pid" 2>/dev/null)" || true
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
+  # pid мог достаться чужому процессу — сверяем командную строку.
+  ps -o args= -p "$pid" 2>/dev/null | grep -qF "$STATE_DIR/portfwd.py" || return 1
+  printf '%s' "$pid"
+}
+
+portfwd_start() { # [quiet] — поднять форвардер (устаревший — перезапустить)
+  local pid name log="$STATE_DIR/portfwd.log"
+  resolve_engine
+  if pid="$(portfwd_pid)"; then
+    # Тот же devstack и тот же движок — не трогаем: рестарт рвал бы живые соединения.
+    if [ "$(cut -d' ' -f2- "$STATE_DIR/.portfwd.pid" 2>/dev/null)" = "$DEVSTACK_VERSION $ENGINE" ]; then
+      [ -n "${1:-}" ] || echo "Автопроброс портов: уже работает (pid $pid) — список: devstack ports"
+      return 0
+    fi
+    portfwd_stop quiet
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "ВНИМАНИЕ: автопроброс портов включён, но на хосте нет python3 — пропускаю." >&2
+    return 0
+  fi
+  name="$(env_get STACK_NAME)"; name="${name:-devstack}"
+  # Лог пополняется только событиями (порт появился/пропал) — храним один старый.
+  if [ -f "$log" ] && [ "$(wc -c < "$log")" -gt 1048576 ]; then mv -f "$log" "$log.1"; fi
+  nohup python3 "$STATE_DIR/portfwd.py" host --engine "$ENGINE" --container "$name-dev" \
+    --state "$STATE_DIR" --version "$DEVSTACK_VERSION" </dev/null >>"$log" 2>&1 &
+  echo "Автопроброс портов: включён — порты контейнера появятся на localhost (список: devstack ports)"
+}
+
+portfwd_stop() { # [quiet]
+  local pid i=0
+  if ! pid="$(portfwd_pid)"; then
+    [ -n "${1:-}" ] || echo "Автопроброс портов: не запущен"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  while [ "$i" -lt 20 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.25; i=$((i+1)); done
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  [ -n "${1:-}" ] || echo "Автопроброс портов: остановлен"
+}
+
+# По галочке: поднять форвардер, если контейнер запущен, а форвардера ещё нет.
+portfwd_auto() {
+  autoforward_enabled || return 0
+  local name; name="$(env_get STACK_NAME)"; name="${name:-devstack}"
+  resolve_engine
+  [ "$("$ENGINE" container inspect --format '{{.State.Running}}' "$name-dev" 2>/dev/null)" = "true" ] || return 0
+  portfwd_start quiet
+}
+
+cmd_ports() {
+  local act=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --start) act=start; shift;;
+      --stop)  act=stop; shift;;
+      *) die "ports: неизвестный флаг $1 (есть --start, --stop)";;
+    esac
+  done
+  require_env
+  case "$act" in
+    start) portfwd_start; return 0;;
+    stop)  portfwd_stop; return 0;;
+  esac
+  local pid st="$STATE_DIR/.portfwd.status" log="$STATE_DIR/portfwd.log"
+  if pid="$(portfwd_pid)"; then
+    echo "Автопроброс портов: работает (pid $pid) — $(head -1 "$st" 2>/dev/null || echo 'запускается')"
+    tail -n +2 "$st" 2>/dev/null | sed 's/^/  /'
+  else
+    if autoforward_enabled; then
+      echo "Автопроброс портов: включён в .env, но не запущен — поднимется на devstack up"
+      echo "  (или сразу: devstack ports --start)"
+    else
+      echo "Автопроброс портов: выключен. Включить: DEVSTACK_AUTOFORWARD=1 в devstack env"
+      echo "  (разово, без галочки: devstack ports --start)"
+    fi
+    if [ -s "$log" ]; then
+      echo "Последнее из лога:"
+      tail -n 3 "$log" | sed 's/^/  /'
+    fi
+  fi
+  echo "Лог: $log"
 }
 
 # ---------------------------------------------------------------------------
@@ -916,6 +1374,11 @@ cmd_check() {
 
   echo "  [i] сеть: полный интернет (агент свободен). host.docker.internal не"
   echo "      добавлен, но открытые тобой порты на хосте достижимы по gateway-IP."
+  if autoforward_enabled; then
+    echo "  [i] автопроброс портов ВКЛ: всё, что слушает порт в контейнере, открыто на"
+    echo "      127.0.0.1 хоста (только loopback, наружу не торчит). Учти: агент может"
+    echo "      занять ещё свободный порт хоста раньше твоего сервиса (devstack ports)."
+  fi
 
   # host-маунты: должен быть только проект (rw) и read-only hooks.
   # source берём ТОЛЬКО у записей с `type: bind` — иначе в список попадает и
@@ -1178,6 +1641,7 @@ cmd_rm() {
     local a=""; read -r -p "Продолжить? [y/N]: " a || true
     case "${a:-n}" in y|Y|yes|Yes|YES) :;; *) echo "Отменено."; return 0;; esac
   fi
+  portfwd_stop quiet
   compose down 2>/dev/null || true
   if [ "$purge" = 1 ]; then
     resolve_engine 2>/dev/null || true
@@ -1212,7 +1676,7 @@ main() {
   # text_quest up`. Только для команд без собственных позиционных аргументов
   # (root и logs передают аргументы дальше — для них используй -p или CWD).
   case "$cmd" in
-    up|down|shell|rebuild|check|provision|config|path|env|devcontainer|rm|remove|code)
+    up|down|shell|rebuild|check|doctor|provision|config|path|env|devcontainer|rm|remove|code|ports)
       if [ -z "$PROJECT_ARG" ] && [ $# -gt 0 ]; then
         case "$1" in -*) :;; *) PROJECT_ARG="$1"; shift;; esac
       fi;;
@@ -1220,13 +1684,16 @@ main() {
 
   case "$cmd" in
     init)    cmd_init "$@";;
-    up)      require_env; compose up -d --build;;
-    rebuild) require_env; compose build --no-cache && compose up -d;;
-    shell)   require_env; compose exec dev bash;;
+    # && перед portfwd_auto: иначе упавший build/up вернул бы код 0.
+    up)      require_env; compose up -d --build && portfwd_auto;;
+    rebuild) require_env; compose build --no-cache && compose up -d && portfwd_auto;;
+    shell)   require_env; portfwd_auto; compose exec dev bash;;
     root)    require_env
              if [ "$#" -gt 0 ]; then compose exec -u 0 dev "$@"; else compose exec -u 0 dev bash; fi;;
-    down)    require_env; compose down;;
+    down)    require_env; portfwd_stop quiet; compose down;;
     check)   cmd_check;;
+    doctor)  cmd_doctor "$@";;
+    ports)   cmd_ports "$@";;
     setup)   cmd_setup "$@";;
     provision) require_env; compose exec dev bash -lc \
               'set -o pipefail; \
@@ -1261,8 +1728,10 @@ exit $?
 # ===========================================================================
 # Дальше bash не доходит (exit выше). Это payload с шаблонами: extract_file
 # достаёт секции по маркерам "#==FILE:<имя>" и раскладывает их в
-# ~/.config/devstack/projects/<slug>/ (см. materialize).
+# ~/.config/devstack/projects/<slug>/ (см. materialize). Обёртка в heredoc —
+# чтобы `bash -n` не разбирал шаблоны как bash (среди них есть Python).
 # ===========================================================================
+: <<'__DEVSTACK_PAYLOAD__'
 #==FILE:compose.yaml
 # Универсальный dev-контейнер. Файл СГЕНЕРИРОВАН devstack — правки перезапишутся,
 # всё проектное живёт в .env (в этой же папке).
@@ -1618,6 +2087,596 @@ if [ -n "${DEVSTACK_POSTSTART:-}" ]; then
 fi
 
 exec "$@"
+#==FILE:portfwd.py
+#!/usr/bin/env python3
+# Автопроброс портов devstack (DEVSTACK_AUTOFORWARD=1) — как в VS Code: всё, что
+# внутри контейнера начинает слушать TCP-порт, становится доступно на
+# 127.0.0.1:<тот же порт> хоста. Файл СГЕНЕРИРОВАН devstack — правки перезапишутся.
+#
+# Одна программа — две роли:
+#   host  — на хосте (запускает devstack): держит ОДИН процесс
+#           `<движок> exec -i <контейнер> python3 -c <этот файл> agent` и
+#           открывает 127.0.0.1:<порт> под каждый порт, о котором сообщил агент;
+#   agent — в контейнере: раз в секунду читает /proc/net/tcp{,6} (LISTEN) и
+#           доводит соединения до сервиса внутри.
+# Все соединения мультиплексируются в stdin/stdout этого exec'а: движок портов
+# не публикует, compose не меняется, периметр прежний. Поэтому достижим и
+# сервис, слушающий 127.0.0.1 ВНУТРИ контейнера (vite, codex login) — так же
+# работает и VS Code.
+#
+# Агент — недоверенная сторона (внутри свободный агент). Поэтому каналы
+# открывает только host, номера портов проверяются, число портов и размер
+# кадров ограничены, подписи процессов чистятся от управляющих символов, а
+# слушает host только loopback.
+import argparse
+import asyncio
+import fcntl
+import json
+import os
+import signal
+import socket
+import struct
+import sys
+import time
+
+PROTO = 1
+HDR = struct.Struct("!BII")          # тип кадра, канал, длина данных
+OPEN, DATA, EOF, CLOSE, HELLO, PORTS = 1, 2, 3, 4, 10, 11
+CHUNK = 64 * 1024
+MAX_FRAME = 1 << 20
+MAX_PORTS = 64
+WBUF_LIMIT = 64 << 20   # получатель не читает: канал рвём, а не копим память
+GRACE = 3.0             # порт пропал (перезапуск dev-сервера) — подождать
+ROLE = "host"
+
+
+def log(msg):
+    sys.stderr.write("%s %s%s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "[agent] " if ROLE == "agent" else "", msg))
+    sys.stderr.flush()
+
+
+def _reap(t):
+    if not t.cancelled() and t.exception() is not None:
+        log("внутренняя ошибка: %r" % (t.exception(),))
+
+
+def spawn(coro):
+    # Исключение фоновой задачи — в лог, а не «Task exception was never retrieved».
+    t = asyncio.ensure_future(coro)
+    t.add_done_callback(_reap)
+    return t
+
+
+class ProtoError(Exception):
+    pass
+
+
+class Chan:
+    __slots__ = ("w", "pending", "sent_eof", "got_eof")
+
+    def __init__(self, w=None):
+        self.w, self.pending = w, bytearray()
+        self.sent_eof = self.got_eof = False
+
+
+class Mux:
+    """Каналы (TCP-соединения) поверх одного потока кадров — stdin/stdout exec'а.
+
+    Полузакрытие честное: EOF одной стороны — это shutdown(SHUT_WR) у другой;
+    канал живёт, пока EOF не прошёл в обе стороны. CLOSE — обрыв.
+    """
+
+    def __init__(self, r, w):
+        self.r, self.w = r, w
+        self.chans = {}
+        self.seq = 0
+        self.lock = asyncio.Lock()
+        self.dead = False
+
+    async def send(self, t, ch=0, data=b""):
+        if self.dead:
+            return
+        try:
+            self.w.write(HDR.pack(t, ch, len(data)) + data)
+            async with self.lock:          # drain() параллельно не вызывают
+                await self.w.drain()
+        except (OSError, RuntimeError):
+            self.close_all()
+
+    async def recv(self):
+        t, ch, n = HDR.unpack(await self.r.readexactly(HDR.size))
+        if n > MAX_FRAME:
+            raise ProtoError("кадр %d байт" % n)
+        return t, ch, (await self.r.readexactly(n)) if n else b""
+
+    def open_chan(self, w):
+        self.seq = self.seq % 0xFFFFFFFF + 1
+        self.chans[self.seq] = Chan(w)
+        return self.seq
+
+    def attach(self, ch, w):
+        # Агент: соединение с сервисом установлено — отдать накопленное.
+        c = self.chans.get(ch)
+        if c is None:
+            w.close()
+            return False
+        c.w = w
+        if c.pending:
+            w.write(bytes(c.pending))
+        c.pending = bytearray()
+        if c.got_eof:
+            w.write_eof()
+        return True
+
+    async def pump(self, ch, r):
+        """Локальный сокет -> кадры DATA, в конце EOF (CLOSE — при ошибке)."""
+        try:
+            while True:
+                d = await r.read(CHUNK)
+                if not d:
+                    break
+                if ch not in self.chans:
+                    return
+                await self.send(DATA, ch, d)
+        except OSError:
+            if ch in self.chans:
+                self.drop(ch)
+                await self.send(CLOSE, ch)
+            return
+        c = self.chans.get(ch)
+        if c is not None:
+            c.sent_eof = True
+            await self.send(EOF, ch)
+            if c.got_eof:
+                self.drop(ch)
+
+    async def on_data(self, ch, d):
+        c = self.chans.get(ch)
+        if c is None or c.got_eof:
+            return
+        if c.w is None:
+            c.pending += d
+            full = len(c.pending) > WBUF_LIMIT
+        else:
+            full = c.w.is_closing() or c.w.transport.get_write_buffer_size() > WBUF_LIMIT
+            if not full:
+                c.w.write(d)
+        if full:
+            self.drop(ch)
+            await self.send(CLOSE, ch)
+
+    def on_eof(self, ch):
+        c = self.chans.get(ch)
+        if c is None:
+            return
+        c.got_eof = True
+        if c.w is not None and not c.w.is_closing():
+            try:
+                c.w.write_eof()
+            except OSError:
+                pass
+        if c.sent_eof:
+            self.drop(ch)
+
+    def drop(self, ch):
+        c = self.chans.pop(ch, None)
+        if c is not None and c.w is not None:
+            c.w.close()
+
+    def close_all(self):
+        self.dead = True
+        for ch in list(self.chans):
+            self.drop(ch)
+
+
+# ---------------------------------------------------------------------------
+# agent — внутри контейнера
+# ---------------------------------------------------------------------------
+def decode_addr(h):
+    raw = bytes.fromhex(h)
+    if sys.byteorder == "little":   # ядро печатает 32-битные слова в порядке байтов хоста
+        raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+    if len(raw) == 4:
+        return socket.inet_ntop(socket.AF_INET, raw)
+    a = socket.inet_ntop(socket.AF_INET6, raw)
+    return a[7:] if a.startswith("::ffff:") and "." in a else a
+
+
+def listeners():
+    """{порт: [(адрес, inode), ...]} — слушающие TCP-сокеты сетевого ns контейнера."""
+    res = {}
+    for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(name) as f:
+                rows = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            f = row.split()
+            if len(f) < 10 or f[3] != "0A":          # 0A = LISTEN
+                continue
+            addr, port = f[1].rsplit(":", 1)
+            res.setdefault(int(port, 16), []).append((decode_addr(addr), f[9]))
+    return res
+
+
+def targets(addrs):
+    """Куда подключаться внутри: «любой адрес» -> loopback, конкретный — он сам."""
+    out = []
+    for a in addrs:
+        for t in {"0.0.0.0": ("127.0.0.1",), "::": ("::1", "127.0.0.1")}.get(a, (a,)):
+            if t not in out:
+                out.append(t)
+    return out
+
+
+def ephemeral():
+    # Порты из эфемерного диапазона выдаёт ядро на bind(0): внутренние слушатели
+    # (VS Code Server, встроенный DNS docker и т.п.), а не dev-серверы.
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            lo, hi = map(int, f.read().split())
+        return lo, hi
+    except (OSError, ValueError):
+        return 32768, 60999
+
+
+def owners(inodes):
+    """inode сокета -> командная строка владельца (где /proc это позволяет)."""
+    want, found = set(inodes), {}
+    for pid in os.listdir("/proc"):
+        if len(found) == len(want):
+            break
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir("/proc/%s/fd" % pid)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                link = os.readlink("/proc/%s/fd/%s" % (pid, fd))
+            except OSError:
+                continue
+            ino = link[8:-1] if link.startswith("socket:[") else None
+            if ino in want and ino not in found:
+                try:
+                    with open("/proc/%s/cmdline" % pid, "rb") as f:
+                        argv = [x for x in f.read().split(b"\0") if x]
+                    found[ino] = b" ".join(argv).decode("utf-8", "replace")[:200]
+                except OSError:
+                    pass
+    return found
+
+
+async def scan(mux, ports):
+    lo, hi = ephemeral()
+    seen, labels, last = {}, {}, None
+    while True:
+        now = time.monotonic()
+        fresh = {}
+        for port, ent in listeners().items():
+            addrs = [a for a, _ in ent if a != "127.0.0.11"]   # DNS docker
+            if not addrs or lo <= port <= hi:
+                continue
+            ports[port] = targets(addrs)
+            seen[port] = now
+            if port not in labels:
+                fresh[port] = [i for _, i in ent]
+        if fresh:
+            own = owners(i for v in fresh.values() for i in v)
+            for port, inos in fresh.items():
+                labels[port] = next((own[i] for i in inos if i in own), "")
+        for port in [p for p, t in seen.items() if now - t > GRACE]:
+            del seen[port]
+            ports.pop(port, None)
+            labels.pop(port, None)
+        cur = sorted(seen)
+        if cur != last:
+            last = cur
+            await mux.send(PORTS, 0, json.dumps(
+                [{"port": p, "label": labels.get(p, "")} for p in cur]).encode())
+        await asyncio.sleep(1)
+
+
+async def connect(mux, ch, port, ports):
+    for addr in ports.get(port, ()):
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_connection(addr, port), 5)
+        except (OSError, asyncio.TimeoutError):
+            continue
+        if mux.attach(ch, w):
+            await mux.pump(ch, r)
+        return
+    if ch in mux.chans:
+        mux.drop(ch)
+        await mux.send(CLOSE, ch)
+
+
+async def agent_main():
+    loop = asyncio.get_running_loop()
+    out = os.fdopen(os.dup(1), "wb", buffering=0)
+    os.dup2(2, 1)               # случайный print() не должен попасть в поток кадров
+    r = asyncio.StreamReader(limit=2 * MAX_FRAME)
+    await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(r), sys.stdin)
+    wt, wp = await loop.connect_write_pipe(asyncio.streams.FlowControlMixin, out)
+    mux = Mux(r, asyncio.StreamWriter(wt, wp, None, loop))
+    ports = {}
+    await mux.send(HELLO, 0, json.dumps({"proto": PROTO}).encode())
+    spawn(scan(mux, ports))
+    try:
+        while not mux.dead:
+            t, ch, data = await mux.recv()
+            if t == OPEN:
+                if ch not in mux.chans and len(data) == 2:
+                    mux.chans[ch] = Chan()
+                    spawn(connect(mux, ch, struct.unpack("!H", data)[0], ports))
+            elif t == DATA:
+                await mux.on_data(ch, data)
+            elif t == EOF:
+                mux.on_eof(ch)
+            elif t == CLOSE:
+                mux.drop(ch)
+    except asyncio.IncompleteReadError:
+        pass                    # host закрыл stdin — штатный выход
+    mux.close_all()
+
+
+# ---------------------------------------------------------------------------
+# host — на хосте
+# ---------------------------------------------------------------------------
+def clean(s):
+    # Подпись приходит от агента: ESC-последовательности и т.п. — в пробелы.
+    s = s if isinstance(s, str) else ""
+    return "".join(c if c.isprintable() else " " for c in s)[:80]
+
+
+def host_ports(p):
+    # Тот же номер; занят — следующие. Привилегированный (<1024) без root не
+    # открыть — пробуем 8000+p (80 -> 8080, 443 -> 8443).
+    yield p
+    base = p if p >= 1024 else p + 8000
+    for i in range(1 if base == p else 0, 10):
+        if base + i <= 65535:
+            yield base + i
+
+
+class Status:
+    """Человекочитаемое состояние для `devstack ports` (атомарная перезапись)."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def write(self, head, rows=()):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join([head] + list(rows)) + "\n")
+        os.replace(tmp, self.path)
+
+    def clear(self):
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+class Forwards:
+    """Порты контейнера -> слушатели 127.0.0.1 на хосте."""
+
+    def __init__(self, a, mux, st):
+        self.a, self.mux, self.st = a, mux, st
+        self.fw = {}        # порт контейнера -> [порт хоста, сервер, подпись]
+        self.busy = {}      # порт контейнера -> подпись (свободного порта хоста нет)
+
+    async def apply(self, items):
+        want = {}
+        for it in items if isinstance(items, list) else ():
+            p = it.get("port") if isinstance(it, dict) else None
+            if type(p) is int and 1 <= p <= 65535:
+                want[p] = clean(it.get("label"))
+                if len(want) >= MAX_PORTS:
+                    break
+        for p in [p for p in self.fw if p not in want]:
+            hp, srv, _ = self.fw.pop(p)
+            srv.close()
+            log("- %d (был на localhost:%d)" % (p, hp))
+        self.busy = {}
+        for p, label in sorted(want.items()):
+            if p in self.fw:
+                self.fw[p][2] = label
+                continue
+            hp, srv = await self.listen(p)
+            if srv is None:
+                self.busy[p] = label
+                log("! %d: на хосте нет свободного порта (%d и следующие) — не пробрасываю" % (p, p))
+                continue
+            self.fw[p] = [hp, srv, label]
+            log(("+ %d -> localhost:%d%s  %s" % (
+                p, hp, "" if hp == p else " (%d на хосте недоступен)" % p, label)).rstrip())
+        self.publish()
+
+    async def listen(self, p):
+        for hp in host_ports(p):
+            try:
+                srv = await asyncio.start_server(
+                    lambda r, w, p=p: self.client(p, r, w), "127.0.0.1", hp)
+                return hp, srv
+            except OSError:
+                continue
+        return None, None
+
+    async def client(self, p, r, w):
+        if self.mux.dead:
+            w.close()
+            return
+        ch = self.mux.open_chan(w)
+        await self.mux.send(OPEN, ch, struct.pack("!H", p))
+        await self.mux.pump(ch, r)
+
+    def publish(self):
+        rows = []
+        for p in sorted(self.fw):
+            hp, _, label = self.fw[p]
+            note = "" if hp == p else "  (%d на хосте недоступен)" % p
+            rows.append(("%5d -> localhost:%-5d%s  %s" % (p, hp, note, label)).rstrip())
+        for p in sorted(self.busy):
+            rows.append(("%5d -> НЕ проброшен: на хосте нет свободного порта  %s"
+                         % (p, self.busy[p])).rstrip())
+        self.st.write("подключён к %s" % self.a.container,
+                      rows or ["(в контейнере пока никто не слушает порт)"])
+
+    def close_all(self):
+        for hp, srv, _ in self.fw.values():
+            srv.close()
+        self.fw, self.busy = {}, {}
+
+
+async def container_state(a):
+    try:
+        p = await asyncio.create_subprocess_exec(
+            a.engine, "container", "inspect", "--format", "{{.State.Running}}", a.container,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await p.communicate()
+    except OSError:
+        return "absent"
+    if p.returncode != 0:
+        return "absent"
+    return "running" if out.strip() == b"true" else "stopped"
+
+
+async def session(a, st, src):
+    """Один exec в контейнер. True — агент успел ответить (связь была)."""
+    proc = await asyncio.create_subprocess_exec(
+        a.engine, "exec", "-i", a.container, "python3", "-c", src, "agent",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, limit=2 * MAX_FRAME)
+    mux = Mux(proc.stdout, proc.stdin)
+    fw = Forwards(a, mux, st)
+    hello = False
+    try:
+        t, _, data = await asyncio.wait_for(mux.recv(), 60)
+        info = json.loads(data) if t == HELLO else None
+        if not isinstance(info, dict) or info.get("proto") != PROTO:
+            raise ProtoError("агент ответил не тем (версия протокола?)")
+        hello = True
+        log("подключён к %s" % a.container)
+        fw.publish()
+        while True:
+            t, ch, data = await mux.recv()
+            if t == PORTS:
+                await fw.apply(json.loads(data))
+            elif t == DATA:
+                await mux.on_data(ch, data)
+            elif t == EOF:
+                mux.on_eof(ch)
+            elif t == CLOSE:
+                mux.drop(ch)
+            else:
+                raise ProtoError("неизвестный кадр %d" % t)
+    except asyncio.IncompleteReadError:
+        why = "связь с агентом оборвалась" if hello else "агент не запустился (в контейнере нужен python3 >= 3.7)"
+    except asyncio.TimeoutError:
+        why = "агент не ответил за 60 с"
+    except (ProtoError, ValueError) as e:
+        why = "сбой протокола: %s" % e
+    finally:
+        fw.close_all()
+        mux.close_all()
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), 2)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+    log(why)
+    st.write("нет связи с агентом: %s — переподключаюсь" % why)
+    return hello
+
+
+async def host_loop(a, st):
+    src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    down_since, backoff, fails = None, 1, 0
+    while True:
+        state = await container_state(a)
+        if state != "running":
+            down_since = down_since or time.monotonic()
+            if time.monotonic() - down_since > a.wait:
+                log("контейнер %s не запущен %d с — выхожу" % (a.container, a.wait))
+                return
+            st.write("жду контейнер %s (%s)" % (
+                a.container, "остановлен" if state == "stopped" else "его нет"))
+            await asyncio.sleep(3)
+            continue
+        down_since = None
+        t0 = time.monotonic()
+        try:
+            ok = await session(a, st, src)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:      # сбой самого host — не повод умирать молча
+            log("ошибка сессии: %r" % (e,))
+            ok = False
+        fails = 0 if ok else fails + 1
+        if fails >= 5:
+            log("агент 5 раз подряд не запустился — выхожу (подробности выше)")
+            return
+        backoff = 1 if time.monotonic() - t0 > 30 else min(backoff * 2, 30)
+        await asyncio.sleep(backoff)
+
+
+async def host_main(a):
+    try:
+        os.setsid()             # своя сессия: закрытие терминала нас не касается
+    except OSError:
+        pass
+    # pid-файл и есть замок: второй экземпляр на тот же проект молча выходит.
+    fd = os.open(os.path.join(a.state, ".portfwd.pid"), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    os.ftruncate(fd, 0)
+    os.write(fd, ("%d %s %s\n" % (os.getpid(), a.version, a.engine)).encode())
+    st = Status(os.path.join(a.state, ".portfwd.status"))
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, task.cancel)
+    log("старт: %s exec %s (devstack %s)" % (a.engine, a.container, a.version))
+    try:
+        await host_loop(a, st)
+    except asyncio.CancelledError:
+        log("остановлен")
+    finally:
+        st.clear()
+        os.ftruncate(fd, 0)
+
+
+def main():
+    global ROLE
+    if sys.argv[1:2] == ["agent"]:
+        ROLE = "agent"
+        asyncio.run(agent_main())
+        return
+    ap = argparse.ArgumentParser(description="devstack: автопроброс портов контейнера")
+    ap.add_argument("role", choices=["host"])
+    ap.add_argument("--engine", required=True)
+    ap.add_argument("--container", required=True)
+    ap.add_argument("--state", required=True, help="папка состояния проекта")
+    ap.add_argument("--version", default="")
+    ap.add_argument("--wait", type=int, default=600,
+                    help="сколько секунд ждать незапущенный контейнер")
+    asyncio.run(host_main(ap.parse_args()))
+
+
+if __name__ == "__main__":
+    main()
 #==FILE:hooks/postcreate.sh.example
 #!/usr/bin/env bash
 # Пример многошагового postcreate. Скопируй в postcreate.sh (в этой же папке
@@ -1631,3 +2690,4 @@ npx playwright install chromium
 # npm run build
 # ./scripts/seed-db.sh
 #==FILE:__end__
+__DEVSTACK_PAYLOAD__
